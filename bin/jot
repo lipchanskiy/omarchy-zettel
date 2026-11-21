@@ -1,0 +1,825 @@
+#!/bin/bash
+# jot: a thin, stateless wrapper around zk for the lipchanskiy.jot shell plugin.
+#
+# Every command prints one JSON document on stdout, so the QML side never has
+# to parse zk's human output. Notebooks are passed in as --nb NAME PATH pairs;
+# the script keeps no configuration of its own.
+#
+#   jot status   --nb NAME PATH...            zk presence and each notebook's state
+#   jot search   [--limit N] --nb NAME PATH... -- QUERY
+#   jot new      --nb NAME PATH -- TEXT       create a note (first line is the title)
+#   jot daily    --nb NAME PATH -- TEXT       append a timestamped entry to today's journal
+#   jot types    --nb NAME PATH               note types (zk groups and templates) of a notebook
+#   jot types    add TYPE --nb NAME PATH      add a note type: a group with its own folder and template
+#   jot init     PATH                         create a notebook with Jot's defaults
+#   jot notebook list|add NAME PATH|remove NAME|default NAME
+#                                             manage the notebooks in Jot's config
+#   jot config [path]                         create the config if missing, print its path
+#   jot setup [--first-run] [--remove]        shortcut, `jot` command and config (see cmd_setup)
+#
+# Jot's settings live in ${XDG_CONFIG_HOME:-~/.config}/jot/config.jsonc. The
+# window reads them itself and passes what a command needs as options:
+# --inbox DIR and --journal DIR (folders inside the notebook) and
+# --no-timestamps for daily.
+#
+# new and daily also take --type ID (a type from `jot types`), --title-label
+# (the journal heading) and --date/--weekday (localized date parts handed to
+# templates as {{extra.date}} and {{extra.weekday}}), all formatted by the
+# shell in the user's language.
+#
+# User text only ever travels as argv or stdin, never through eval or a shell
+# string, so a query or note cannot run commands.
+
+set -uo pipefail
+
+# Character counts and case folding below assume UTF-8.
+export LC_ALL=C.UTF-8
+
+die() {
+  jq -cn --arg error "$1" '{error: $error}'
+  exit 1
+}
+
+command -v jq >/dev/null 2>&1 || {
+  printf '{"error":"jq is not installed"}\n'
+  exit 1
+}
+
+expand_path() {
+  local p=$1
+  [[ $p == "~" ]] && p=$HOME
+  [[ $p == "~/"* ]] && p=$HOME/${p#"~/"}
+  printf '%s' "$p"
+}
+
+is_notebook() { [[ -d $1/.zk ]]; }
+
+# --- argument parsing ------------------------------------------------------
+
+cmd=${1:-}
+[[ -n $cmd ]] && shift
+
+nb_names=()
+nb_paths=()
+limit=50
+text=""
+positional=()
+note_type=""
+title_label=""
+date_label=""
+weekday_label=""
+inbox_dir="inbox"
+journal_dir="journal"
+timestamps=true
+
+while (($#)); do
+  case $1 in
+  --nb)
+    (($# >= 3)) || die "--nb needs NAME and PATH"
+    nb_names+=("$2")
+    nb_paths+=("$(expand_path "$3")")
+    shift 3
+    ;;
+  --limit)
+    [[ ${2:-} =~ ^[0-9]+$ ]] || die "--limit needs a number"
+    limit=$2
+    shift 2
+    ;;
+  --no-timestamps)
+    timestamps=false
+    shift
+    ;;
+  --inbox | --journal)
+    (($# >= 2)) || die "$1 needs a value"
+    [[ /$2/ != */../* && $2 != /* ]] || die "$1 must be a folder inside the notebook"
+    if [[ $1 == --inbox ]]; then inbox_dir=${2%/}; else journal_dir=${2%/}; fi
+    [[ -n $journal_dir ]] || journal_dir="journal"
+    shift 2
+    ;;
+  --first-run | --remove)
+    positional+=("$1")
+    shift
+    ;;
+  --type | --title-label | --date | --weekday)
+    (($# >= 2)) || die "$1 needs a value"
+    case $1 in
+    --type) note_type=$2 ;;
+    --title-label) title_label=$2 ;;
+    --date) date_label=$2 ;;
+    --weekday) weekday_label=$2 ;;
+    esac
+    shift 2
+    ;;
+  --)
+    shift
+    text=${1:-}
+    shift $(($# > 0 ? 1 : 0))
+    break
+    ;;
+  -*) die "unknown option: $1" ;;
+  *)
+    positional+=("$1")
+    shift
+    ;;
+  esac
+done
+
+((limit > 200)) && limit=200
+
+need_zk() { command -v zk >/dev/null 2>&1 || die "zk is not installed"; }
+
+need_one_notebook() {
+  ((${#nb_paths[@]} == 1)) || die "exactly one --nb is required"
+  is_notebook "${nb_paths[0]}" || die "not a zk notebook: ${nb_paths[0]}"
+}
+
+# --- status ----------------------------------------------------------------
+
+cmd_status() {
+  local zk_version="" i rows="[]"
+  if command -v zk >/dev/null 2>&1; then
+    zk_version=$(zk --version 2>/dev/null | head -1)
+  fi
+  for i in "${!nb_paths[@]}"; do
+    local p=${nb_paths[$i]} exists=false notebook=false
+    [[ -d $p ]] && exists=true
+    is_notebook "$p" && notebook=true
+    rows=$(jq -c --arg name "${nb_names[$i]}" --arg path "$p" \
+      --argjson exists $exists --argjson notebook $notebook \
+      '. + [{name: $name, path: $path, exists: $exists, notebook: $notebook}]' <<<"$rows")
+  done
+  jq -cn --arg zk "$zk_version" --argjson notebooks "$rows" \
+    '{zk: ($zk != ""), zkVersion: $zk, notebooks: $notebooks}'
+}
+
+# --- search ---
+
+# zk's note JSON, trimmed to what the window shows, tagged with its notebook.
+note_rows() {
+  jq -c --arg nb "$1" --arg root "$2" '
+        [ .[] | {
+            notebook: $nb,
+            root: $root,
+            title: (.title // "" | if . == "" then null else . end),
+            filename: .filename,
+            path: .path,
+            absPath: .absPath,
+            lead: ((.lead // "") | gsub("\\s+"; " ") | .[0:200]),
+            tags: (.tags // []),
+            modified: .modified,
+            created: .created,
+            wordCount: (.wordCount // 0)
+          } ]' 2>/dev/null || echo '[]'
+}
+
+# Turns free text into zk filters: #words become tag filters, every other word
+# becomes a quoted FTS5 prefix term, so typing "mee" finds "meeting" and stray
+# quotes or operators in the query can never produce an FTS syntax error.
+build_filters() {
+  local query=${1//$'\n'/ } word terms=()
+  filter_args=()
+  read -ra words <<<"$query"
+  for word in "${words[@]}"; do
+    if [[ $word == "#"?* ]]; then
+      word=${word#\#}
+      word=${word//[\"\*]/}
+      [[ -n $word ]] && filter_args+=(--tag "$word*")
+      continue
+    fi
+    word=${word//\"/}
+    word=${word//\*/}
+    [[ -n $word ]] && terms+=("\"$word\"*")
+  done
+  if ((${#terms[@]})); then
+    filter_args+=(--match "${terms[*]}")
+  fi
+}
+
+# The forgiving second pass, used only when full-text search finds nothing:
+# one case-insensitive regex per word (zk ANDs them), е and ё treated alike,
+# and long words cut back to a stem so "встречи" still finds "встреча".
+build_fuzzy_filters() {
+  local query=${1//$'\n'/ } word n stem
+  fuzzy_args=()
+  read -ra words <<<"$query"
+  for word in "${words[@]}"; do
+    [[ $word == "#"* ]] && continue
+    word=${word//[\"\*]/}
+    n=${#word}
+    ((n == 0)) && continue
+    if ((n >= 6)); then stem=${word:0:n-2}; elif ((n == 5)); then stem=${word:0:4}; else stem=$word; fi
+    stem=$(sed -E 's/[][\\.^$*+?(){}|\/-]/\\&/g; s/[еёЕЁ]/[еёЕЁ]/g' <<<"$stem")
+    fuzzy_args+=(--match "(?i)$stem")
+  done
+}
+
+cmd_search() {
+  need_zk
+  ((${#nb_paths[@]})) || die "no notebooks given"
+  build_filters "$text"
+
+  local sort_args=(--sort modified-)
+  # With a text query zk ranks by relevance; keep that order.
+  for arg in "${filter_args[@]}"; do
+    [[ $arg == --match ]] && sort_args=()
+  done
+
+  local i lists=() errors="[]"
+  for i in "${!nb_paths[@]}"; do
+    local p=${nb_paths[$i]} name=${nb_names[$i]} out
+    if ! is_notebook "$p"; then
+      errors=$(jq -c --arg n "$name" '. + [$n]' <<<"$errors")
+      continue
+    fi
+    if out=$(zk list --notebook-dir "$p" --format json --quiet --no-pager \
+      --limit "$limit" "${sort_args[@]}" "${filter_args[@]}" 2>/dev/null); then
+      [[ -z $out ]] && out="[]"
+      lists+=("$(note_rows "$name" "$p" <<<"$out")")
+    else
+      # zk exits non-zero for a query it cannot run; treat as no results.
+      lists+=("[]")
+    fi
+  done
+
+  # Nothing at all? Try once more, forgiving endings and е/ё.
+  local total=0 l
+  for l in "${lists[@]}"; do total=$((total + $(jq length <<<"$l"))); done
+  if ((total == 0)) && [[ -n ${text//[[:space:]]/} && -z ${JOT_NO_FUZZY:-} ]]; then
+    build_fuzzy_filters "$text"
+    if ((${#fuzzy_args[@]})); then
+      local tag_args=() k
+      for ((k = 0; k < ${#filter_args[@]}; k++)); do
+        [[ ${filter_args[$k]} == --tag ]] && tag_args+=(--tag "${filter_args[$((k + 1))]}")
+      done
+      lists=()
+      for i in "${!nb_paths[@]}"; do
+        local p=${nb_paths[$i]} name=${nb_names[$i]} out
+        is_notebook "$p" || continue
+        out=$(zk list --notebook-dir "$p" --format json --quiet --no-pager --limit "$limit" \
+          --sort modified- --match-strategy re "${fuzzy_args[@]}" "${tag_args[@]}" 2>/dev/null) || out="[]"
+        [[ -z $out ]] && out="[]"
+        lists+=("$(note_rows "$name" "$p" <<<"$out")")
+      done
+    fi
+  fi
+
+  # Interleave notebooks so relevance ranking survives the merge, then cap.
+  printf '%s\n' "${lists[@]:-[]}" | jq -cs --argjson limit "$limit" --argjson errors "$errors" '
+    . as $lists
+    | ([ $lists[] | length ] | max // 0) as $n
+    | { notes: ([ range(0; $n) as $i | $lists[] | .[$i] // empty ] | .[0:$limit]),
+        errors: $errors }'
+}
+
+# --- types -----------------------------------------------------------------
+
+# A notebook's note types, read from its own zk configuration:
+#   - every [group.NAME] except journal: notes go to the group's first path
+#     with the group's template;
+#   - every template in .zk/templates no group uses (and not default/journal):
+#     notes go to the inbox with that template.
+# Each type says whether its template has {{content}}, so `new` knows to add
+# the typed text itself when it does not.
+types_json() {
+  local root=$1 cfg=$1/.zk/config.toml groups=""
+  if [[ -f $cfg ]]; then
+    groups=$(awk '
+      function flush() { if (g != "") printf "%s\037%s\037%s\n", g, dir, tpl }
+      /^[[:space:]]*\[/ {
+        line = $0; gsub(/[[:space:]]/, "", line); sub(/#.*/, "", line)
+        if (line ~ /^\[group\.("[^"]+"|[A-Za-z0-9_-]+)(\.note)?\]$/) {
+          name = line; sub(/^\[group\./, "", name); sub(/\]$/, "", name)
+          sub(/\.note$/, "", name); gsub(/"/, "", name)
+          if (name != g) { flush(); g = name; dir = ""; tpl = "" }
+          ingroup = 1; next
+        }
+        flush(); g = ""; ingroup = 0; next
+      }
+      ingroup && /^[[:space:]]*paths[[:space:]]*=/ && dir == "" { if (match($0, /"[^"]*"/)) dir = substr($0, RSTART + 1, RLENGTH - 2) }
+      ingroup && /^[[:space:]]*template[[:space:]]*=/ { if (match($0, /"[^"]*"/)) tpl = substr($0, RSTART + 1, RLENGTH - 2) }
+      END { flush() }' "$cfg")
+  fi
+
+  local default_tpl="default.md"
+  if [[ -f $cfg ]]; then
+    default_tpl=$(awk '/^[[:space:]]*\[/ { top = ($0 ~ /^[[:space:]]*\[note\]/) ; next }
+      top && /^[[:space:]]*template[[:space:]]*=/ { if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit } }' "$cfg")
+    [[ -n $default_tpl ]] || default_tpl="default.md"
+  fi
+
+  local rows=() used=" default.md journal.md $default_tpl " id dir tpl
+  while IFS=$'\037' read -r id dir tpl; do
+    [[ -z $id || $id == journal ]] && continue
+    [[ -n $tpl ]] && used+="$tpl "
+    rows+=("$(jq -cn --arg id "$id" --arg dir "$dir" --arg tpl "${tpl:-$default_tpl}" \
+      --argjson content "$(template_has_content "$root" "${tpl:-$default_tpl}")" \
+      --arg tp "$root/.zk/templates/${tpl:-$default_tpl}" \
+      '{id: $id, kind: "group", dir: $dir, template: $tpl, templatePath: $tp, hasContent: $content}')")
+  done <<<"$groups"
+
+  local f name
+  for f in "$root"/.zk/templates/*.md "$root"/.zk/templates/*.hbs; do
+    [[ -f $f ]] || continue
+    name=${f##*/}
+    [[ $used == *" $name "* ]] && continue
+    rows+=("$(jq -cn --arg id "${name%.*}" --arg tpl "$name" \
+      --argjson content "$(template_has_content "$root" "$name")" \
+      --arg tp "$root/.zk/templates/$name" \
+      '{id: $id, kind: "template", dir: "", template: $tpl, templatePath: $tp, hasContent: $content}')")
+  done
+
+  printf '%s\n' "${rows[@]}" | jq -cs '[ .[] | select(. != null) ] | unique_by(.id)'
+}
+
+template_has_content() {
+  local f=$1/.zk/templates/$2
+  if [[ -f $f ]] && grep -qE '\{\{\{?[[:space:]]*content[[:space:]]*\}\}' "$f"; then echo true; else echo false; fi
+}
+
+cmd_types() {
+  need_one_notebook
+  local root=${nb_paths[0]}
+  case ${positional[0]:-list} in
+  list) types_json "$root" ;;
+  add)
+    ((${#positional[@]} == 2)) || die "usage: jot types add TYPE --nb NAME PATH"
+    add_type "$root" "${positional[1]}"
+    ;;
+  *) die "usage: jot types [add TYPE] --nb NAME PATH" ;;
+  esac
+}
+
+# A new type is a zk group with a folder and a template of the same name,
+# appended to the notebook's config. The template starts as a plain title +
+# text note; the user shapes it from there (Ctrl+E in Jot opens it).
+add_type() {
+  local root=$1 name=$2 cfg=$1/.zk/config.toml
+  local c bad=false
+  [[ -z $name || ${#name} -gt 40 ]] && bad=true
+  for c in ' ' $'\t' $'\n' '"' '\' '/' '.' '#' '[' ']' "'" '='; do
+    [[ $name == *"$c"* ]] && bad=true
+  done
+  [[ $name =~ [[:cntrl:]] ]] && bad=true
+  $bad && die "a type name is one word without quotes, slashes, dots or brackets"
+  [[ $name == journal ]] && die "journal is built in"
+  types_json "$root" | jq -e --arg id "$name" 'any(.[]; .id == $id)' >/dev/null && die "type $name already exists"
+
+  mkdir -p "$root/$name" "$root/.zk/templates" || die "cannot create the $name folder"
+  local tpl=$root/.zk/templates/$name.md
+  if [[ ! -f $tpl ]]; then
+    printf '# {{title}}\n\n{{content}}\n' >"$tpl" || die "cannot write $tpl"
+  fi
+  {
+    printf '\n# Note type added by Jot. Shape its template in .zk/templates/%s.md\n' "$name"
+    printf '[group."%s"]\npaths = ["%s"]\n\n[group."%s".note]\ntemplate = "%s.md"\n' "$name" "$name" "$name" "$name"
+  } >>"$cfg" || die "cannot update $cfg"
+  types_json "$root" | jq -c --arg id "$name" '.[] | select(.id == $id)'
+}
+
+# zk splits --extra values on commas, so localized dates travel in parts and
+# lose any comma of their own.
+extra_args() {
+  extras=()
+  [[ -n $date_label ]] && extras+=(--extra "date=${date_label//,/}")
+  [[ -n $weekday_label ]] && extras+=(--extra "weekday=${weekday_label//,/}")
+}
+
+# --- new -------------------------------------------------------------------
+
+cmd_new() {
+  need_zk
+  need_one_notebook
+  local root=${nb_paths[0]}
+  [[ -n ${text//[[:space:]]/} || -n $note_type ]] || die "empty note"
+
+  local title body tags title_clean dir
+  title=${text%%$'\n'*}
+  if [[ $text == *$'\n'* ]]; then body=${text#*$'\n'}; else body=""; fi
+
+  # Hashtags in the first line are tags, not part of the title.
+  tags=$(grep -oE '(^|[[:space:]])#[^[:space:]#]+' <<<"$title" | tr -d '[:space:]' | tr '#' ' ' | xargs)
+  title_clean=$(sed -E 's/(^|[[:space:]])#[^[:space:]#]+//g; s/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$title")
+  if [[ -n $title_clean ]]; then
+    title=$title_clean
+    if [[ -n $tags ]]; then
+      local tagline=""
+      for t in $tags; do tagline+="#$t "; done
+      body=${body:+$body$'\n\n'}${tagline% }
+    fi
+  fi
+
+  dir=$root
+  if [[ -n $inbox_dir ]]; then
+    dir=$root/$inbox_dir
+    mkdir -p "$dir" || die "cannot create $dir"
+  fi
+
+  local type_args=() has_content=true
+  if [[ -n $note_type ]]; then
+    local t kind tdir
+    t=$(types_json "$root" | jq -c --arg id "$note_type" '.[] | select(.id == $id)')
+    [[ -n $t ]] || die "unknown note type: $note_type"
+    kind=$(jq -r .kind <<<"$t")
+    tdir=$(jq -r .dir <<<"$t")
+    has_content=$(jq -r .hasContent <<<"$t")
+    if [[ $kind == group ]]; then
+      if [[ -n $tdir && $tdir != *..* ]]; then
+        dir=$root/$tdir
+        mkdir -p "$dir" || die "cannot create $dir"
+      else
+        type_args=(--group "$note_type")
+      fi
+    else
+      type_args=(--template "$(jq -r .template <<<"$t")")
+    fi
+    # A typed note without a title is named after its date.
+    [[ -z ${title//[[:space:]]/} ]] && title=${date_label:-$(date +%F)}
+  fi
+
+  extra_args
+  local path content=$body
+  [[ $has_content == true ]] || content=""
+  path=$(printf '%s' "$content" | zk new --notebook-dir "$root" --interactive \
+    --title "$title" "${type_args[@]}" "${extras[@]}" --print-path "$dir" 2>/dev/null | tail -1) || die "zk new failed"
+  [[ -n $path && -f $path ]] || die "zk new did not create a note"
+
+  # A template without {{content}} would drop the text; keep it.
+  if [[ $has_content != true && -n ${body//[[:space:]]/} ]]; then
+    printf '\n%s\n' "$body" >>"$path"
+  fi
+  jq -cn --arg path "$path" --arg title "$title" '{path: $path, title: $title}'
+}
+
+# --- daily -----------------------------------------------------------------
+
+cmd_daily() {
+  need_one_notebook
+  local root=${nb_paths[0]}
+  [[ -n ${text//[[:space:]]/} ]] || die "empty entry"
+
+  local day file heading
+  day=$(date +%F)
+  heading=${title_label:-$day}
+  mkdir -p "$root/$journal_dir" || die "cannot create journal folder"
+  file=$root/$journal_dir/$day.md
+
+  # Jot writes the day's heading itself: the journal folder is a setting, and
+  # zk would name a note in a folder outside its journal group differently.
+  if [[ ! -f $file ]]; then
+    printf '# %s\n' "$heading" >"$file" || die "cannot write journal"
+  fi
+
+  # "- HH:MM first line", continuation lines indented under the bullet.
+  local entry first rest
+  first=${text%%$'\n'*}
+  if [[ $timestamps == true ]]; then entry="- $(date +%H:%M) $first"; else entry="- $first"; fi
+  if [[ $text == *$'\n'* ]]; then
+    rest=${text#*$'\n'}
+    entry+=$'\n'$(sed 's/^/  /' <<<"$rest")
+  fi
+  # Make sure the entry starts on its own line after a blank separator.
+  [[ -s $file && $(tail -c1 "$file" | od -An -c | tr -d ' ') != '\n' ]] && printf '\n' >>"$file"
+  printf '\n%s\n' "$entry" >>"$file" || die "cannot write journal"
+
+  jq -cn --arg path "$file" --arg title "$heading" '{path: $path, title: $title}'
+}
+
+# --- init ------------------------------------------------------------------
+
+do_init() {
+  local root=$1
+  if is_notebook "$root"; then
+    jq -cn --arg path "$root" '{path: $path, created: false}'
+    return
+  fi
+  mkdir -p "$root/.zk/templates" "$root/inbox" "$root/journal" || die "cannot create $root"
+
+  cat >"$root/.zk/config.toml" <<'EOF'
+# Notebook created by Jot (lipchanskiy.jot). Everything here is plain zk
+# configuration: https://zk-org.github.io/zk/config/config.html
+#
+# Every [group.NAME] (except journal) is a note type in Jot: type /NAME in
+# the Jot window to use one. Typing /NAME for a type that does not exist yet
+# offers to create it, which adds a group like the commented example below.
+#
+# [group."idea"]
+# paths = ["idea"]
+#
+# [group."idea".note]
+# template = "idea.md"
+
+[note]
+language = "en"
+default-title = "Untitled"
+filename = "{{id}}-{{slug (substring title 0 60)}}"
+extension = "md"
+template = "default.md"
+id-charset = "alphanum"
+id-length = 4
+id-case = "lower"
+
+[format.markdown]
+link-format = "wiki"
+hashtags = true
+colon-tags = false
+multiword-tags = false
+
+[group.journal]
+paths = ["journal"]
+
+[group.journal.note]
+filename = "{{format-date now '%Y-%m-%d'}}"
+template = "journal.md"
+
+[lsp.diagnostics]
+wiki-title = "hint"
+dead-link = "error"
+EOF
+
+  cat >"$root/.zk/templates/default.md" <<'EOF'
+# {{title}}
+
+{{content}}
+EOF
+
+  cat >"$root/.zk/templates/journal.md" <<'EOF'
+# {{title}}
+EOF
+
+  if command -v zk >/dev/null 2>&1; then
+    zk index --notebook-dir "$root" --quiet >/dev/null 2>&1
+  fi
+  jq -cn --arg path "$root" '{path: $path, created: true}'
+}
+
+cmd_init() {
+  ((${#positional[@]} == 1)) || die "init needs a path"
+  do_init "$(expand_path "${positional[0]}")"
+}
+
+# --- config ----------------------------------------------------------------
+
+CONFIG_FILE=${JOT_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/jot/config.jsonc}
+
+# JSONC → JSON: drops // and /* */ comments, then trailing commas, leaving
+# string contents alone. Mirrors stripJsonc in Jot.js.
+strip_jsonc() {
+  awk '
+    { buf = buf $0 "\n" }
+    END {
+      n = length(buf); out = ""; ins = 0; esc = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(buf, i, 1)
+        if (ins) { out = out c; if (esc) esc = 0; else if (c == "\\") esc = 1; else if (c == "\"") ins = 0; continue }
+        if (c == "\"") { ins = 1; out = out c; continue }
+        if (c == "/" && substr(buf, i + 1, 1) == "/") { while (i <= n && substr(buf, i, 1) != "\n") i++; out = out "\n"; continue }
+        if (c == "/" && substr(buf, i + 1, 1) == "*") { j = index(substr(buf, i + 2), "*/"); if (j == 0) break; i = i + j + 2; continue }
+        out = out c
+      }
+      n = length(out); res = ""; ins = 0; esc = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(out, i, 1)
+        if (ins) { res = res c; if (esc) esc = 0; else if (c == "\\") esc = 1; else if (c == "\"") ins = 0; continue }
+        if (c == "\"") { ins = 1; res = res c; continue }
+        if (c == ",") { k = i + 1; while (k <= n && substr(out, k, 1) ~ /[ \t\r\n]/) k++; d = substr(out, k, 1); if (d == "}" || d == "]") continue }
+        res = res c
+      }
+      printf "%s", res
+    }' "$1"
+}
+
+# The whole config as JSON with every key filled in.
+read_config() {
+  local json='{}'
+  if [[ -f $CONFIG_FILE ]]; then
+    json=$(strip_jsonc "$CONFIG_FILE" | jq -c . 2>/dev/null) || die "cannot parse $CONFIG_FILE"
+  fi
+  jq -c '
+    (if type == "object" then . else {} end) as $c
+    | {
+        notebooks: (if ($c.notebooks | type) == "array" and ($c.notebooks | length) > 0
+          then [ $c.notebooks[] | if type == "string" then {name: (split("/") | map(select(. != "")) | last), path: .} else {name, path} end ]
+          else [{name: "Notes", path: "~/Notes"}] end),
+        defaultNotebook: ($c.defaultNotebook // ""),
+        inboxFolder: (if ($c.inboxFolder | type) == "string" then $c.inboxFolder else "inbox" end),
+        journalFolder: (if ($c.journalFolder | type) == "string" then $c.journalFolder else "journal" end),
+        journalTimestamps: (if ($c.journalTimestamps | type) == "boolean" then $c.journalTimestamps else true end),
+        defaultCapture: (if $c.defaultCapture == "journal" then "journal" else "note" end),
+        editor: (if ($c.editor | type) == "string" then $c.editor else "" end)
+      }
+    | if .defaultNotebook == "" then .defaultNotebook = .notebooks[0].name else . end' <<<"$json"
+}
+
+# Writes the config from JSON, always with the documented template around the
+# values. Comments of your own are not kept: edit this template instead.
+write_config() {
+  local c=$1 notebooks tmp
+  notebooks=$(jq -r '.notebooks | map("    " + ({name, path} | tojson)) | join(",\n")' <<<"$c")
+  mkdir -p "${CONFIG_FILE%/*}" || die "cannot create ${CONFIG_FILE%/*}"
+  tmp=$(mktemp "$CONFIG_FILE.XXXXXX") || die "cannot write $CONFIG_FILE"
+  cat >"$tmp" <<EOF
+// Jot settings. Changes apply as soon as you save; no restart needed.
+// Open this file from the Jot window with Ctrl+, (Ctrl+comma).
+//
+// The shortcut that opens Jot (Super+N) is set in ~/.config/hypr/bindings.lua.
+// \`jot notebook add|remove|default\` rewrites this file from the template
+// below, so comments you add yourself may not survive it.
+{
+  // Notebooks Jot searches and writes to. Each is a folder of Markdown notes
+  // managed by zk (https://zk-org.github.io/zk/). Paths may start with ~.
+  // To add one and create it if needed: jot notebook add NAME PATH
+  "notebooks": [
+$notebooks
+  ],
+
+  // The notebook new notes and journal entries go to. Press Tab in the Jot
+  // window to pick another one for a single note. Must match a name above.
+  "defaultNotebook": $(jq '.defaultNotebook' <<<"$c"),
+
+  // What Ctrl+Enter does with what you typed: "note" saves it as a new note,
+  // "journal" adds it to today's journal. Alt+Enter always does the other one.
+  "defaultCapture": $(jq '.defaultCapture' <<<"$c"),
+
+  // Folder inside the notebook for new notes. Created when
+  // needed. Use "" to keep new notes at the top of the notebook.
+  "inboxFolder": $(jq '.inboxFolder' <<<"$c"),
+
+  // Folder inside the notebook for the daily journal, one file
+  // per day named like 2026-11-21.md.
+  "journalFolder": $(jq '.journalFolder' <<<"$c"),
+
+  // Start each journal entry with the time it was written: "- 14:05 ...".
+  "journalTimestamps": $(jq '.journalTimestamps' <<<"$c"),
+
+  // Program that opens notes. Leave empty to use Omarchy's default editor
+  // (change that with: omarchy default editor). Terminal editors such as
+  // nvim, helix or nano open in a terminal window.
+  "editor": $(jq '.editor' <<<"$c")
+}
+
+// Note types (type / in Jot) are not set here. They are the zk groups
+// and templates of each notebook: NOTEBOOK/.zk/config.toml and
+// NOTEBOOK/.zk/templates/. Every [group.NAME] except journal is a type.
+EOF
+  mv "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; die "cannot replace $CONFIG_FILE"; }
+}
+
+cmd_config() {
+  local sub=${positional[0]:-path}
+  [[ $sub == path ]] || die "usage: jot config [path]"
+  [[ -f $CONFIG_FILE ]] || write_config "$(read_config)"
+  jq -cn --arg path "$CONFIG_FILE" '{path: $path}'
+}
+
+# --- notebook --------------------------------------------------------------
+
+cmd_notebook() {
+  local sub=${positional[0]:-list} config name path
+  config=$(read_config)
+  local current
+  current=$(jq -c .notebooks <<<"$config")
+
+  case $sub in
+  list)
+    jq -c '{notebooks, defaultNotebook}' <<<"$config"
+    return
+    ;;
+  add)
+    ((${#positional[@]} == 3)) || die "usage: jot notebook add NAME PATH"
+    name=${positional[1]}
+    path=$(expand_path "${positional[2]}")
+    [[ $path == /* ]] || path=$PWD/$path
+    path=${path%/}
+    [[ -n ${name//[[:space:]]/} ]] || die "the notebook needs a name"
+    jq -e --arg n "$name" 'any(.[]; .name == $n)' <<<"$current" >/dev/null && die "a notebook named $name already exists"
+    local init_out
+    init_out=$(do_init "$path") || { printf '%s\n' "$init_out"; exit 1; }
+    # Paths under $HOME are kept as ~/..., so the config stays portable.
+    [[ $path == "$HOME"/* ]] && path="~/${path#"$HOME"/}"
+    config=$(jq -c --arg n "$name" --arg p "$path" '.notebooks += [{name: $n, path: $p}]' <<<"$config")
+    ;;
+  remove)
+    ((${#positional[@]} == 2)) || die "usage: jot notebook remove NAME"
+    name=${positional[1]}
+    jq -e --arg n "$name" 'any(.[]; .name == $n)' <<<"$current" >/dev/null || die "no notebook named $name"
+    config=$(jq -c --arg n "$name" '.notebooks |= map(select(.name != $n))
+      | if .defaultNotebook == $n then .defaultNotebook = (.notebooks[0].name // "") else . end' <<<"$config")
+    [[ $(jq '.notebooks | length' <<<"$config") -gt 0 ]] || die "cannot remove the last notebook"
+    ;;
+  default)
+    ((${#positional[@]} == 2)) || die "usage: jot notebook default NAME"
+    name=${positional[1]}
+    jq -e --arg n "$name" 'any(.[]; .name == $n)' <<<"$current" >/dev/null || die "no notebook named $name"
+    config=$(jq -c --arg n "$name" '.defaultNotebook = $n' <<<"$config")
+    ;;
+  *) die "usage: jot notebook list|add NAME PATH|remove NAME|default NAME" ;;
+  esac
+
+  write_config "$config"
+  jq -c '{notebooks, defaultNotebook}' <<<"$config"
+}
+
+# --- setup -----------------------------------------------------------------
+
+STATE_DIR=${JOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/jot}
+BINDINGS_FILE=${JOT_BINDINGS:-$HOME/.config/hypr/bindings.lua}
+BIN_LINK=${JOT_BIN_LINK:-$HOME/.local/bin/jot}
+PLUGIN_ID=lipchanskiy.jot
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+# Shortcuts Jot may take, best first: "label|hyprland modmask|key".
+# Modmask bits: Shift 1, Ctrl 4, Alt 8, Super 64.
+SHORTCUTS=("SUPER + N|64|N" "SUPER + ALT + N|72|N" "SUPER + SHIFT + ALT + N|73|N")
+
+# The shortcut already bound to Jot in bindings.lua, if any.
+bound_shortcut() {
+  [[ -f $BINDINGS_FILE ]] || return 0
+  grep -E "^[^-]*panel *= *\"$PLUGIN_ID\"" "$BINDINGS_FILE" | head -1 | sed -nE 's/.*bind\("([^"]+)".*/\1/p'
+}
+
+shortcut_free() {
+  local modmask=$1 key=$2
+  command -v hyprctl >/dev/null 2>&1 || return 0
+  ! hyprctl binds -j 2>/dev/null | jq -e --argjson m "$modmask" --arg k "$key" \
+    'any(.[]; .modmask == $m and (.key | ascii_upcase) == $k)' >/dev/null
+}
+
+# Sets up what a plugin install cannot: a shortcut in the user's Hyprland
+# bindings, the `jot` command on PATH, and the commented settings file.
+# Safe to run again; --first-run does nothing after the first time.
+# --remove undoes the shortcut and the command (settings and notes stay).
+cmd_setup() {
+  local first_run=false remove=false arg
+  for arg in "${positional[@]}"; do
+    case $arg in
+    --first-run) first_run=true ;;
+    --remove) remove=true ;;
+    *) die "usage: jot setup [--first-run] [--remove]" ;;
+    esac
+  done
+
+  if $remove; then
+    if [[ -f $BINDINGS_FILE ]] && grep -q "$PLUGIN_ID" "$BINDINGS_FILE"; then
+      local tmp
+      tmp=$(mktemp "$BINDINGS_FILE.XXXXXX") || die "cannot write next to $BINDINGS_FILE"
+      grep -v "$PLUGIN_ID" "$BINDINGS_FILE" >"$tmp"
+      mv "$tmp" "$BINDINGS_FILE" || die "cannot update $BINDINGS_FILE"
+    fi
+    [[ -L $BIN_LINK && $(readlink -f "$BIN_LINK") == "$SELF" ]] && rm -f "$BIN_LINK"
+    rm -f "$STATE_DIR/setup.json"
+    jq -cn '{removed: true}'
+    return
+  fi
+
+  if $first_run && [[ -f $STATE_DIR/setup.json ]]; then
+    jq -c '. + {firstRun: false}' "$STATE_DIR/setup.json" 2>/dev/null || jq -cn '{firstRun: false}'
+    return
+  fi
+
+  # Shortcut.
+  local shortcut added=false entry label modmask key
+  shortcut=$(bound_shortcut)
+  if [[ -z $shortcut && -f $BINDINGS_FILE ]]; then
+    for entry in "${SHORTCUTS[@]}"; do
+      IFS='|' read -r label modmask key <<<"$entry"
+      if shortcut_free "$modmask" "$key"; then
+        printf '\n-- Jot: find and capture notes (%s). Remove with: jot setup --remove\no.bind("%s", "Notes", { panel = "%s" })\n' \
+          "$PLUGIN_ID" "$label" "$PLUGIN_ID" >>"$BINDINGS_FILE" || die "cannot update $BINDINGS_FILE"
+        shortcut=$label
+        added=true
+        break
+      fi
+    done
+  fi
+
+  # `jot` command. An existing file that is not ours is left alone.
+  local linked=false
+  if [[ -L $BIN_LINK && $(readlink -f "$BIN_LINK") == "$SELF" ]]; then
+    linked=true
+  elif [[ ! -e $BIN_LINK ]]; then
+    mkdir -p "${BIN_LINK%/*}" && ln -s "$SELF" "$BIN_LINK" && linked=true
+  fi
+
+  # Settings.
+  [[ -f $CONFIG_FILE ]] || write_config "$(read_config)"
+
+  local result
+  result=$(jq -cn --arg s "$shortcut" --argjson added $added --argjson linked $linked \
+    --arg bindings "$BINDINGS_FILE" --arg config "$CONFIG_FILE" \
+    '{shortcut: $s, shortcutAdded: $added, commandLinked: $linked, bindings: $bindings, config: $config}')
+  mkdir -p "$STATE_DIR" && printf '%s\n' "$result" >"$STATE_DIR/setup.json"
+  jq -c --argjson first $first_run '. + {firstRun: $first}' <<<"$result"
+}
+
+case $cmd in
+status) cmd_status ;;
+search) cmd_search ;;
+types) cmd_types ;;
+new) cmd_new ;;
+daily) cmd_daily ;;
+init) cmd_init ;;
+notebook) cmd_notebook ;;
+config) cmd_config ;;
+setup) cmd_setup ;;
+*) die "usage: jot status|search|types|new|daily|init|notebook|config|setup" ;;
+esac
