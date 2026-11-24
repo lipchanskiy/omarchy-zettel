@@ -11,7 +11,8 @@
 #   jot daily    --nb NAME PATH -- TEXT       append a timestamped entry to today's journal
 #   jot types    --nb NAME PATH               note types (zk groups and templates) of a notebook
 #   jot types    add TYPE --nb NAME PATH      add a note type: a group with its own folder and template
-#   jot init     PATH                         create a notebook with Jot's defaults
+#   jot init     PATH                         create a notebook with Jot's defaults, or make an
+#                                             existing one safe to sync (.gitignore, .stignore, .gitattributes)
 #   jot notebook list|add NAME PATH|remove NAME|default NAME
 #                                             manage the notebooks in Jot's config
 #   jot config [path]                         create the config if missing, print its path
@@ -53,6 +54,21 @@ expand_path() {
 }
 
 is_notebook() { [[ -d $1/.zk ]]; }
+
+# Replaces FILE with what is on stdin, atomically. A symlinked FILE (stow and
+# other dotfile managers) is written through to its target, and the target's
+# permissions are kept.
+replace_file() {
+  local file target tmp
+  file=$1
+  target=$(readlink -f -- "$file" 2>/dev/null) || target=$file
+  [[ -n $target ]] || target=$file
+  mkdir -p -- "${target%/*}" || return 1
+  tmp=$(mktemp "$target.XXXXXX") || return 1
+  if ! cat >"$tmp"; then rm -f -- "$tmp"; return 1; fi
+  if [[ -e $target ]]; then chmod --reference="$target" -- "$tmp" 2>/dev/null; else chmod 644 -- "$tmp"; fi
+  mv -- "$tmp" "$target" || { rm -f -- "$tmp"; return 1; }
+}
 
 # --- argument parsing ------------------------------------------------------
 
@@ -141,12 +157,19 @@ cmd_status() {
     zk_version=$(zk --version 2>/dev/null | head -1)
   fi
   for i in "${!nb_paths[@]}"; do
-    local p=${nb_paths[$i]} exists=false notebook=false
-    [[ -d $p ]] && exists=true
-    is_notebook "$p" && notebook=true
+    local p=${nb_paths[$i]} exists=false notebook=false empty=false conflicts="[]"
+    [[ -e $p ]] && exists=true
+    [[ -d $p && -z $(ls -A -- "$p" 2>/dev/null) ]] && empty=true
+    if is_notebook "$p"; then
+      notebook=true
+      conflicts=$(conflict_files "$p" | sed "s|^$p/||" | sort -u | while IFS= read -r c; do
+        printf '%s\037%s\n' "$c" "$(conflict_original <<<"$c")"; done |
+        jq -Rsc 'split("\n") | map(select(. != "") | split("\u001f") | {copy: .[0], original: .[1]})')
+    fi
     rows=$(jq -c --arg name "${nb_names[$i]}" --arg path "$p" \
-      --argjson exists $exists --argjson notebook $notebook \
-      '. + [{name: $name, path: $path, exists: $exists, notebook: $notebook}]' <<<"$rows")
+      --argjson exists $exists --argjson notebook $notebook --argjson empty $empty --argjson conflicts "$conflicts" \
+      --argjson home "$([[ ${p%/} == "${HOME%/}" ]] && echo true || echo false)" \
+      '. + [{name: $name, path: $path, exists: $exists, empty: $empty, notebook: $notebook, isHome: $home, conflicts: $conflicts}]' <<<"$rows")
   done
   jq -cn --arg zk "$zk_version" --argjson notebooks "$rows" \
     '{zk: ($zk != ""), zkVersion: $zk, notebooks: $notebooks}'
@@ -286,8 +309,10 @@ types_json() {
     groups=$(awk '
       function flush() { if (g != "") printf "%s\037%s\037%s\n", g, dir, tpl }
       /^[[:space:]]*\[/ {
-        line = $0; gsub(/[[:space:]]/, "", line); sub(/#.*/, "", line)
-        if (line ~ /^\[group\.("[^"]+"|[A-Za-z0-9_-]+)(\.note)?\]$/) {
+        line = $0; sub(/[[:space:]]+#.*$/, "", line)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+        if (line ~ /^\[[[:space:]]*group\.("[^"]+"|[A-Za-z0-9_-]+)(\.note)?[[:space:]]*\]$/) {
+          sub(/^\[[[:space:]]*/, "[", line); sub(/[[:space:]]*\]$/, "]", line)
           name = line; sub(/^\[group\./, "", name); sub(/\]$/, "", name)
           sub(/\.note$/, "", name); gsub(/"/, "", name)
           if (name != g) { flush(); g = name; dir = ""; tpl = "" }
@@ -355,12 +380,13 @@ cmd_types() {
 add_type() {
   local root=$1 name=$2 cfg=$1/.zk/config.toml
   local c bad=false
-  [[ -z $name || ${#name} -gt 40 ]] && bad=true
-  for c in ' ' $'\t' $'\n' '"' '\' '/' '.' '#' '[' ']' "'" '='; do
+  [[ -z $name || ${#name} -gt 40 || $name == -* ]] && bad=true
+  # Also what Windows forbids in a folder name, since notebooks get synced there.
+  for c in ' ' $'\t' $'\n' '"' '\' '/' '.' '#' '[' ']' "'" '=' ':' '*' '?' '<' '>' '|'; do
     [[ $name == *"$c"* ]] && bad=true
   done
   [[ $name =~ [[:cntrl:]] ]] && bad=true
-  $bad && die "a type name is one word without quotes, slashes, dots or brackets"
+  $bad && die "a type name is one word without spaces, quotes, slashes, dots, brackets or : * ? < > |"
   [[ $name == journal ]] && die "journal is built in"
   types_json "$root" | jq -e --arg id "$name" 'any(.[]; .id == $id)' >/dev/null && die "type $name already exists"
 
@@ -380,8 +406,8 @@ add_type() {
 # lose any comma of their own.
 extra_args() {
   extras=()
-  [[ -n $date_label ]] && extras+=(--extra "date=${date_label//,/}")
-  [[ -n $weekday_label ]] && extras+=(--extra "weekday=${weekday_label//,/}")
+  [[ -n $date_label ]] && extras+=(--extra="date=${date_label//,/}")
+  [[ -n $weekday_label ]] && extras+=(--extra="weekday=${weekday_label//,/}")
 }
 
 # --- new -------------------------------------------------------------------
@@ -397,13 +423,14 @@ cmd_new() {
   if [[ $text == *$'\n'* ]]; then body=${text#*$'\n'}; else body=""; fi
 
   # Hashtags in the first line are tags, not part of the title.
-  tags=$(grep -oE '(^|[[:space:]])#[^[:space:]#]+' <<<"$title" | tr -d '[:space:]' | tr '#' ' ' | xargs)
+  local -a tags=()
+  mapfile -t tags < <(grep -oE '(^|[[:space:]])#[^[:space:]#]+' <<<"$title" | sed -E 's/^[[:space:]]*#//')
   title_clean=$(sed -E 's/(^|[[:space:]])#[^[:space:]#]+//g; s/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$title")
   if [[ -n $title_clean ]]; then
     title=$title_clean
-    if [[ -n $tags ]]; then
-      local tagline=""
-      for t in $tags; do tagline+="#$t "; done
+    if ((${#tags[@]})); then
+      local tagline="" t
+      for t in "${tags[@]}"; do tagline+="#$t "; done
       body=${body:+$body$'\n\n'}${tagline% }
     fi
   fi
@@ -427,10 +454,10 @@ cmd_new() {
         dir=$root/$tdir
         mkdir -p "$dir" || die "cannot create $dir"
       else
-        type_args=(--group "$note_type")
+        type_args=(--group="$note_type")
       fi
     else
-      type_args=(--template "$(jq -r .template <<<"$t")")
+      type_args=(--template="$(jq -r .template <<<"$t")")
     fi
     # A typed note without a title is named after its date.
     [[ -z ${title//[[:space:]]/} ]] && title=${date_label:-$(date +%F)}
@@ -440,7 +467,7 @@ cmd_new() {
   local path content=$body
   [[ $has_content == true ]] || content=""
   path=$(printf '%s' "$content" | zk new --notebook-dir "$root" --interactive \
-    --title "$title" "${type_args[@]}" "${extras[@]}" --print-path "$dir" 2>/dev/null | tail -1) || die "zk new failed"
+    --title="$title" "${type_args[@]}" "${extras[@]}" --print-path -- "$dir" 2>/dev/null | tail -1) || die "zk new failed"
   [[ -n $path && -f $path ]] || die "zk new did not create a note"
 
   # A template without {{content}} would drop the text; keep it.
@@ -486,10 +513,82 @@ cmd_daily() {
 
 # --- init ------------------------------------------------------------------
 
+# --- sync-friendly notebooks ------------------------------------------------
+
+# Adds LINE to FILE unless FILE already has it. Prints FILE's name if it
+# changed anything, so callers can say what they touched.
+ensure_line() {
+  local file=$1 line=$2
+  [[ -f $file ]] && grep -qxF -- "$line" "$file" && return 0
+  if [[ -s $file && $(tail -c1 "$file" | od -An -c | tr -d ' ') != '\n' ]]; then printf '\n' >>"$file"; fi
+  printf '%s\n' "$line" >>"$file" || return 1
+  printf '%s\n' "${file##*/}"
+}
+
+# Notebooks get synced with git, Syncthing or a cloud folder. zk's index
+# (.zk/notebook.db) is per machine and breaks when two machines write it, so
+# it is kept out; and the journal, which two machines append to on the same
+# day, merges line by line in git instead of conflicting.
+ensure_sync_files() {
+  local root=$1
+  {
+    if [[ ! -f $root/.gitignore ]] || ! grep -q 'notebook.db' "$root/.gitignore"; then
+      ensure_line "$root/.gitignore" "# zk's index is rebuilt on each machine; never sync it (added by Jot)"
+    fi
+    ensure_line "$root/.gitignore" ".zk/notebook.db*"
+    ensure_line "$root/.stignore" "// zk's index is rebuilt on each machine; never sync it (added by Jot)" >/dev/null
+    ensure_line "$root/.stignore" "/.zk/notebook.db*"
+    ensure_line "$root/.gitattributes" "*.md text eol=lf"
+    ensure_line "$root/.gitattributes" "journal/*.md merge=union"
+  } | sort -u
+}
+
+# Brings a notebook Jot made earlier up to what zk users on other machines
+# expect, without touching anything the user changed: the journal template
+# gets a date when it is still Jot's old "# {{title}}", and `zk daily` is
+# added when the config has no [alias] table yet (adding a key to an
+# existing table could not be done safely line by line).
+ensure_zk_compat() {
+  local root=$1 tpl=$1/.zk/templates/journal.md cfg=$1/.zk/config.toml
+  if [[ -f $tpl && $(cat "$tpl") == '# {{title}}' ]]; then
+    printf '%s\n' "# {{format-date now '%Y-%m-%d'}}" >"$tpl" && echo "journal.md"
+  fi
+  if [[ -f $cfg ]] && ! grep -qE '^[[:space:]]*\[alias\]' "$cfg"; then
+    {
+      printf '\n[alias]\n'
+      printf '%s\n' "# \`zk daily\` opens today's journal, the same file Jot's Alt+Enter writes to."
+      printf '%s\n' "daily = 'zk new --no-input \"\$ZK_NOTEBOOK_DIR/journal\"'"
+    } >>"$cfg" && echo "config.toml"
+  fi
+}
+
+# Files sync tools leave behind when two machines changed the same note:
+# Syncthing, Dropbox, Nextcloud/ownCloud, rclone bisync, the OneDrive client,
+# and git merges that stopped half way.
+# The file a conflict copy was made from, by each sync tool's naming rule.
+# A git conflict has no copy: the markers are in the file itself.
+conflict_original() {
+  sed -E -e 's/\.sync-conflict-[^./]*//' -e 's/ \([^()/]*conflicted copy[^()/]*\)//' \
+    -e 's/_conflict-[^./]*//' -e 's/\.conflict[0-9]+$//' -e 's/-safeBackup-[0-9]+//'
+}
+
+conflict_files() {
+  local root=$1
+  find "$root" \( -name .git -o -name .zk -o -name .stversions \) -prune -o -type f \( \
+    -name '*.sync-conflict-*' -o -name "*conflicted copy*" -o -name '*_conflict-*' \
+    -o -name '*.conflict[0-9]*' -o -name '*-safeBackup-[0-9]*' \) -print 2>/dev/null | head -50
+  if [[ -d $root/.git ]] && command -v git >/dev/null 2>&1; then
+    git -C "$root" diff --name-only --diff-filter=U 2>/dev/null | sed "s|^|$root/|" | head -50
+  fi
+}
+
 do_init() {
   local root=$1
   if is_notebook "$root"; then
-    jq -cn --arg path "$root" '{path: $path, created: false}'
+    # An existing notebook only gets what makes it safe to sync.
+    local touched
+    touched=$({ ensure_sync_files "$root"; ensure_zk_compat "$root"; } | jq -Rsc 'split("\n") | map(select(. != ""))')
+    jq -cn --arg path "$root" --argjson t "$touched" '{path: $path, created: false, updated: $t}'
     return
   fi
   mkdir -p "$root/.zk/templates" "$root/inbox" "$root/journal" || die "cannot create $root"
@@ -534,6 +633,10 @@ template = "journal.md"
 [lsp.diagnostics]
 wiki-title = "hint"
 dead-link = "error"
+
+[alias]
+# `zk daily` opens today's journal, the same file Jot's Alt+Enter writes to.
+daily = 'zk new --no-input "$ZK_NOTEBOOK_DIR/journal"'
 EOF
 
   cat >"$root/.zk/templates/default.md" <<'EOF'
@@ -542,9 +645,13 @@ EOF
 {{content}}
 EOF
 
+  # Jot writes the day's heading itself; this template is for zk and its
+  # editor plugins (`zk daily`), which make the day's note without a title.
   cat >"$root/.zk/templates/journal.md" <<'EOF'
-# {{title}}
+# {{format-date now '%Y-%m-%d'}}
 EOF
+
+  ensure_sync_files "$root" >/dev/null
 
   if command -v zk >/dev/null 2>&1; then
     zk index --notebook-dir "$root" --quiet >/dev/null 2>&1
@@ -593,6 +700,8 @@ read_config() {
   local json='{}'
   if [[ -f $CONFIG_FILE ]]; then
     json=$(strip_jsonc "$CONFIG_FILE" | jq -c . 2>/dev/null) || die "cannot parse $CONFIG_FILE"
+    # A file of only comments (or nothing) means all defaults.
+    [[ -n $json ]] || json='{}'
   fi
   jq -c '
     (if type == "object" then . else {} end) as $c
@@ -613,11 +722,9 @@ read_config() {
 # Writes the config from JSON, always with the documented template around the
 # values. Comments of your own are not kept: edit this template instead.
 write_config() {
-  local c=$1 notebooks tmp
+  local c=$1 notebooks
   notebooks=$(jq -r '.notebooks | map("    " + ({name, path} | tojson)) | join(",\n")' <<<"$c")
-  mkdir -p "${CONFIG_FILE%/*}" || die "cannot create ${CONFIG_FILE%/*}"
-  tmp=$(mktemp "$CONFIG_FILE.XXXXXX") || die "cannot write $CONFIG_FILE"
-  cat >"$tmp" <<EOF
+  replace_file "$CONFIG_FILE" <<EOF || die "cannot write $CONFIG_FILE"
 // Jot settings. Changes apply as soon as you save; no restart needed.
 // Open this file from the Jot window with Ctrl+, (Ctrl+comma).
 //
@@ -661,7 +768,6 @@ $notebooks
 // and templates of each notebook: NOTEBOOK/.zk/config.toml and
 // NOTEBOOK/.zk/templates/. Every [group.NAME] except journal is a type.
 EOF
-  mv "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; die "cannot replace $CONFIG_FILE"; }
 }
 
 cmd_config() {
@@ -734,7 +840,8 @@ SHORTCUTS=("SUPER + N|64|N" "SUPER + ALT + N|72|N" "SUPER + SHIFT + ALT + N|73|N
 # The shortcut already bound to Jot in bindings.lua, if any.
 bound_shortcut() {
   [[ -f $BINDINGS_FILE ]] || return 0
-  grep -E "^[^-]*panel *= *\"$PLUGIN_ID\"" "$BINDINGS_FILE" | head -1 | sed -nE 's/.*bind\("([^"]+)".*/\1/p'
+  grep -F "\"$PLUGIN_ID\"" "$BINDINGS_FILE" | grep -vE '^[[:space:]]*--' | grep -E 'panel[[:space:]]*=' \
+    | head -1 | sed -nE 's/.*bind\("([^"]+)".*/\1/p'
 }
 
 shortcut_free() {
@@ -760,10 +867,15 @@ cmd_setup() {
 
   if $remove; then
     if [[ -f $BINDINGS_FILE ]] && grep -q "$PLUGIN_ID" "$BINDINGS_FILE"; then
-      local tmp
-      tmp=$(mktemp "$BINDINGS_FILE.XXXXXX") || die "cannot write next to $BINDINGS_FILE"
-      grep -v "$PLUGIN_ID" "$BINDINGS_FILE" >"$tmp"
-      mv "$tmp" "$BINDINGS_FILE" || die "cannot update $BINDINGS_FILE"
+      # Drop Jot's lines and the blank line setup put before them.
+      local kept
+      kept=$(awk -v id="$PLUGIN_ID" '
+        index($0, id) { if (held) held = 0; next }
+        held { print ""; held = 0 }
+        /^[[:space:]]*$/ { held = 1; next }
+        { print }
+        END { if (held) print "" }' "$BINDINGS_FILE") || die "cannot read $BINDINGS_FILE"
+      printf '%s\n' "$kept" | replace_file "$BINDINGS_FILE" || die "cannot update $BINDINGS_FILE"
     fi
     [[ -L $BIN_LINK && $(readlink -f "$BIN_LINK") == "$SELF" ]] && rm -f "$BIN_LINK"
     rm -f "$STATE_DIR/setup.json"
@@ -804,9 +916,11 @@ cmd_setup() {
   [[ -f $CONFIG_FILE ]] || write_config "$(read_config)"
 
   local result
-  result=$(jq -cn --arg s "$shortcut" --argjson added $added --argjson linked $linked \
+  local bindings_found=false
+  [[ -f $BINDINGS_FILE ]] && bindings_found=true
+  result=$(jq -cn --arg s "$shortcut" --argjson added $added --argjson linked $linked --argjson bf $bindings_found \
     --arg bindings "$BINDINGS_FILE" --arg config "$CONFIG_FILE" \
-    '{shortcut: $s, shortcutAdded: $added, commandLinked: $linked, bindings: $bindings, config: $config}')
+    '{shortcut: $s, shortcutAdded: $added, commandLinked: $linked, bindingsFound: $bf, bindings: $bindings, config: $config}')
   mkdir -p "$STATE_DIR" && printf '%s\n' "$result" >"$STATE_DIR/setup.json"
   jq -c --argjson first $first_run '. + {firstRun: $first}' <<<"$result"
 }

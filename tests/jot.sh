@@ -43,6 +43,12 @@ jot new --nb N "$NB" -- 'Meeting notes about release' >/dev/null
 jot new --nb N "$NB" -- 'Заметка с "кавычками" и * звёздочкой OR NOT' >/dev/null
 long=$(jot new --nb N "$NB" -- "$(printf 'очень%.0s ' {1..40})" | jq -r .path)
 check "long titles make short file names" "$((${#long} - ${#NB} < 90))" "1"
+dash=$(jot new --nb N "$NB" -- '- shopping list' | jq -r '.path // .error')
+check "a title starting with a dash is saved" "$(head -1 "$dash" 2>/dev/null)" "# - shopping list"
+touch "$TMP/SECRETFILE"
+globbed=$(cd "$TMP" && jot new --nb N "$NB" --inbox scratch -- 'Buy milk #* #it'"'"'s #a\b' | jq -r .path)
+check "tags are not glob-expanded" "$(grep -c SECRETFILE "$globbed")" "0"
+check "odd tags survive" "$(tail -1 "$globbed")" '#* #it'"'"'s #a\b'
 check "empty notes are refused" "$(jot new --nb N "$NB" -- '   ' | jq -r .error)" "empty note"
 check "--inbox \"\" saves at the top" "$(dirname "$(jot new --nb N "$NB" --inbox '' -- 'top' | jq -r .path)")" "$NB"
 check "--inbox cannot escape the notebook" "$(jot new --nb N "$NB" --inbox ../x -- y | jq -r .error)" "--inbox must be a folder inside the notebook"
@@ -55,7 +61,7 @@ check "endings are forgiven" "$(titles 'встречи')" '["Встреча с �
 check "е matches ё" "$(titles 'звездочкой')" '["Заметка с \"кавычками\" и * звёздочкой OR NOT"]'
 check "tags filter by prefix" "$(titles '#раб')" '["Встреча с командой"]'
 check "query syntax is inert" "$(titles '* AND (')" '[]'
-check "an empty query lists recent notes" "$(jot search --nb N "$NB" -- '' | jq '.notes | length')" "5"
+check "an empty query lists recent notes" "$(jot search --nb N "$NB" -- '' | jq '.notes | length')" "7"
 check "a missing notebook is reported, not fatal" \
   "$(jot search --nb N "$NB" --nb Gone "$TMP/gone" -- 'meet' | jq -c '[(.notes | length), .errors]')" '[1,["Gone"]]'
 
@@ -74,7 +80,7 @@ check "no stray notes in a custom journal folder" "$(ls "$NB/days" | wc -l)" "1"
 check "add a type" "$(jot types add рецепт --nb N "$NB" | jq -r .dir)" "рецепт"
 check "duplicate types are refused" "$(jot types add рецепт --nb N "$NB" | jq -r .error)" "type рецепт already exists"
 check "journal is reserved" "$(jot types add journal --nb N "$NB" | jq -r .error)" "journal is built in"
-for bad in 'a/b' 'a.b' 'two words' '"q' 'x]' 'a\b' "it's" 'a=b'; do
+for bad in 'a/b' 'a.b' 'two words' '"q' 'x]' 'a\b' "it's" 'a=b' 'a:b' 'a*' 'a?' 'a<b' 'a>b' 'a|b'; do
   check "bad type name: $bad" "$(jot types add "$bad" --nb N "$NB" | jq -r 'has("error")')" "true"
 done
 check "zk still reads the config" "$(zk list --notebook-dir "$NB" -q -P --format '{{title}}' >/dev/null 2>&1 && echo yes)" "yes"
@@ -92,9 +98,79 @@ check "notebook add creates the notebook" "$([[ -d $TMP/work/.zk ]] && echo yes)
 check "notebook default" "$(jot notebook default Work | jq -r .defaultNotebook)" "Work"
 check "duplicate names are refused" "$(jot notebook add Work "$TMP/x" | jq -r .error)" "a notebook named Work already exists"
 sed -i 's/"journalTimestamps": true,/"journalTimestamps": false, \/\/ edited by hand/' "$JOT_CONFIG"
+cp "$JOT_CONFIG" "$TMP/config.bak"
+printf '// only a comment\n' >"$JOT_CONFIG"
+check "a comment-only config means defaults" "$(jot notebook list | jq -r .defaultNotebook)" "Notes"
+jot notebook add Spare "$TMP/spare" >/dev/null
+check "and can be added to" "$(jot notebook list | jq -r '[.notebooks[].name] | join(",")')" "Notes,Spare"
+cp "$TMP/config.bak" "$JOT_CONFIG"
 check "hand edits with comments still parse" "$(jot notebook list | jq -r '.notebooks | length')" "2"
 jot notebook remove Notes >/dev/null
 check "the last notebook stays" "$(jot notebook remove Work | jq -r .error)" "cannot remove the last notebook"
+
+# --- symlinked dotfiles
+mkdir -p "$TMP/dotfiles"
+cp "$JOT_CONFIG" "$TMP/dotfiles/config.jsonc"
+chmod 640 "$TMP/dotfiles/config.jsonc"
+ln -sf "$TMP/dotfiles/config.jsonc" "$JOT_CONFIG"
+jot notebook default Work >/dev/null
+check "a symlinked config stays a symlink" "$([[ -L $JOT_CONFIG ]] && echo yes)" "yes"
+check "its target is updated" "$(grep -c '"defaultNotebook": "Work"' "$TMP/dotfiles/config.jsonc")" "1"
+check "and keeps its permissions" "$(stat -c %a "$TMP/dotfiles/config.jsonc")" "640"
+
+# --- type names from hand-written configs
+printf '\n[group."my notes"]\npaths = ["my notes"]\n' >>"$NB/.zk/config.toml"
+check "group names keep their spaces" "$(jot types --nb N "$NB" | jq -r '[.[].id] | index("my notes") != null')" "true"
+check "type names cannot look like options" "$(jot types add -- --nb --nb N "$NB" | jq -r 'has("error")')" "true"
+
+# --- sync
+check "new notebooks keep the index out of git" "$(grep -cxF '.zk/notebook.db*' "$NB/.gitignore")" "1"
+check "and out of Syncthing" "$(grep -cxF '/.zk/notebook.db*' "$NB/.stignore")" "1"
+mkdir -p "$TMP/old/.zk"; printf 'node_modules\n' >"$TMP/old/.gitignore"
+check "init on an existing notebook adds only the sync files" "$(jot init "$TMP/old" | jq -c .updated)" '[".gitattributes",".gitignore",".stignore"]'
+check "and keeps what was there" "$(head -1 "$TMP/old/.gitignore")" "node_modules"
+check "running it again changes nothing" "$(jot init "$TMP/old" | jq -c .updated)" "[]"
+touch "$NB/inbox/a.sync-conflict-20261121-1234-ABC.md" "$NB/inbox/b (x's conflicted copy 2026-11-21).md"
+check "sync conflicts are reported" "$(jot status --nb N "$NB" | jq '.notebooks[0].conflicts | length')" "2"
+check "each copy names its original" "$(jot status --nb N "$NB" | jq -c '[.notebooks[0].conflicts[].original]')" '["inbox/a.md","inbox/b.md"]'
+touch "$NB/inbox/c.md.conflict2" "$NB/inbox/d-safeBackup-0001.md" "$NB/inbox/e_conflict-20261121-1.md"
+check "other tools' copies too" "$(jot status --nb N "$NB" | jq -c '[.notebooks[0].conflicts[].original] | sort')" '["inbox/a.md","inbox/b.md","inbox/c.md","inbox/d.md","inbox/e.md"]'
+rm -f "$NB/inbox/c.md.conflict2" "$NB/inbox/d-safeBackup-0001.md" "$NB/inbox/e_conflict-20261121-1.md"
+rm -f "$NB/inbox/"*.sync-conflict-* "$NB/inbox/"*conflicted*
+if command -v git >/dev/null 2>&1; then
+  G=$TMP/gitsync
+  jot init "$G/a" >/dev/null
+  git -C "$G/a" init -q && git -C "$G/a" add -A && git -C "$G/a" -c user.name=t -c user.email=t@t commit -qm init
+  git clone -q "$G/a" "$G/b"
+  jot daily --nb A "$G/a" -- 'from machine a' >/dev/null
+  jot daily --nb B "$G/b" -- 'from machine b' >/dev/null
+  git -C "$G/a" add -A && git -C "$G/a" -c user.name=t -c user.email=t@t commit -qm a
+  git -C "$G/b" add -A && git -C "$G/b" -c user.name=t -c user.email=t@t commit -qm b
+  git -C "$G/b" -c user.name=t -c user.email=t@t pull -q --no-rebase --no-edit 2>/dev/null
+  day=$G/b/journal/$(date +%F).md
+  check "git merges one day's journal from two machines" \
+    "$(grep -c 'from machine' "$day")$(grep -c '^<<<<<<<' "$day")" "20"
+  check "the index is not committed" "$(git -C "$G/b" ls-files .zk | grep -c notebook.db)" "0"
+fi
+
+# --- zk outside Jot
+check "zk daily is defined" "$(grep -c '^daily = ' "$NB/.zk/config.toml")" "1"
+check "zk daily opens the day Jot writes to" \
+  "$(cd "$NB" && zk new --no-input --print-path "$NB/journal" 2>/dev/null)" "$NB/journal/$(date +%F).md"
+check "markdown keeps LF line endings in git" "$(grep -cxF '*.md text eol=lf' "$NB/.gitattributes")" "1"
+mkdir -p "$TMP/older/.zk/templates"
+printf '# {{title}}\n' >"$TMP/older/.zk/templates/journal.md"
+printf '[note]\ntemplate = "default.md"\n' >"$TMP/older/.zk/config.toml"
+check "an older Jot notebook is brought up to date" "$(jot init "$TMP/older" | jq -c '.updated | sort')" \
+  '[".gitattributes",".gitignore",".stignore","config.toml","journal.md"]'
+check "its journal template gets a date" "$(cat "$TMP/older/.zk/templates/journal.md")" "# {{format-date now '%Y-%m-%d'}}"
+check "zk still reads its config" "$(zk list --notebook-dir "$TMP/older" -q -P >/dev/null 2>&1 && echo yes)" "yes"
+printf '[alias]\nmine = "zk list"\n' >"$TMP/older2.toml"
+mkdir -p "$TMP/older2/.zk"; mv "$TMP/older2.toml" "$TMP/older2/.zk/config.toml"
+jot init "$TMP/older2" >/dev/null
+check "an existing [alias] table is left alone" "$(grep -c '^\[alias\]' "$TMP/older2/.zk/config.toml")" "1"
+check "a journal template the user changed is left alone" \
+  "$(printf '# My day\n' >"$TMP/older/.zk/templates/journal.md"; jot init "$TMP/older" >/dev/null; cat "$TMP/older/.zk/templates/journal.md")" "# My day"
 
 # --- setup
 printf -- '-- mine\no.bind("SUPER + X", "x", "x")\n' >"$JOT_BINDINGS"
@@ -104,8 +180,14 @@ check "first run links the command" "$(readlink -f "$JOT_BIN_LINK")" "$(readlink
 check "first run happens once" "$(jot setup --first-run | jq -r .firstRun)" "false"
 check "setup does not bind twice" "$(jot setup >/dev/null; grep -c lipchanskiy.jot "$JOT_BINDINGS")" "2"
 jot setup --remove >/dev/null
-check "remove keeps the user's bindings" "$(cat "$JOT_BINDINGS")" $'-- mine\no.bind("SUPER + X", "x", "x")'
+check "remove keeps the user's bindings, without leftovers" "$(cat "$JOT_BINDINGS")" $'-- mine\no.bind("SUPER + X", "x", "x")'
 check "remove drops the link" "$([[ -e $JOT_BIN_LINK ]] && echo yes || echo no)" "no"
+check "remove leaves no trailing blank line" "$(tail -c1 "$JOT_BINDINGS" | od -An -c | tr -d ' ')" '\n'
+printf -- '-- mine\no.bind("SUPER + N", "my-notes", { panel = "lipchanskiy.jot" })\n' >"$JOT_BINDINGS"
+rm -rf "$JOT_STATE_DIR"
+check "an existing binding is found even with a dash in it" "$(jot setup | jq -r '[.shortcut, .shortcutAdded] | join(" ")')" "SUPER + N false"
+rm -f "$JOT_BINDINGS"; rm -rf "$JOT_STATE_DIR"
+check "no bindings.lua is reported as such" "$(jot setup | jq -r '[.shortcut, .bindingsFound] | join(" ")')" " false"
 
 echo
 if ((failed)); then echo "$failed failed"; exit 1; fi

@@ -31,6 +31,30 @@ Item {
   property int captureIndex: 0
   readonly property var captureNotebook: notebooks[Math.min(captureIndex, notebooks.length - 1)]
   property var missingNotebooks: []
+  // Files sync tools left when two machines changed the same note.
+  property var conflicts: []
+  // Which conflict a note is part of: as the copy or as the original.
+  function conflictOf(path) {
+    for (var i = 0; i < root.conflicts.length; i++) {
+      var c = root.conflicts[i]
+      if (c.copy === path) return { role: "copy", conflict: c }
+      if (c.original === path) return { role: "original", conflict: c }
+    }
+    return null
+  }
+  // Ctrl+K: open both versions side by side: the selected note's conflict,
+  // or the first one. The user merges by hand and deletes the copy.
+  function openConflict() {
+    if (root.conflicts.length === 0) return
+    var row = root.selectedRow()
+    var hit = row ? root.conflictOf(row.absPath) : null
+    var c = hit ? hit.conflict : root.conflicts[0]
+    root.close()
+    // One editor per file: many editors (Omarchy's Plain among them) open
+    // only one file at a time.
+    root.openInEditor(c.original)
+    if (c.copy !== c.original) root.openInEditor(c.copy)
+  }
 
   // Note types of the capture notebook: the built-in journal first, then the
   // notebook's zk groups and templates: [{ id, label, dir, template, templatePath }].
@@ -39,10 +63,10 @@ Item {
                                       dir: root.settings.journalFolder, template: "", templatePath: "" }].concat(root.userTypes)
   property int suggestionIndex: 0
   readonly property var prefix: Jot.parseTypePrefix(root.query, root.noteTypes)
-  readonly property bool suggesting: phase === "ready" && prefix.mode === "suggest"
   // The "/" list: matching types, plus "create type" for a new valid name.
-  readonly property var suggestions: {
-    if (!root.suggesting) return []
+  // A "/word" that matches nothing and can't be a type name is plain text.
+  readonly property var typeCandidates: {
+    if (root.prefix.mode !== "suggest") return []
     var list = root.prefix.matches.slice()
     var word = root.query.slice(1).trim()
     var exists = false
@@ -53,14 +77,23 @@ Item {
     if (word && !exists && Jot.validTypeName(word)) list.push({ id: word, label: word, create: true, dir: "", template: "", templatePath: "" })
     return list
   }
+  readonly property bool suggesting: phase === "ready" && prefix.mode === "suggest"
+                                     && (typeCandidates.length > 0 || root.query === "/")
+  readonly property var suggestions: suggesting ? typeCandidates : []
   readonly property string defaultKind: settings.defaultCapture === "journal" ? "daily" : "new"
   readonly property string otherKind: defaultKind === "daily" ? "new" : "daily"
   property var initQueue: []
+  // Text whose save failed; the next open puts it back in the input.
+  property string unsavedText: ""
+  property int unsavedNotebook: -1
+  property bool enterPending: false
+  property string missingTool: "zk"
+  property string lastConfigText: "\u0000"
   property var initTried: ({})
   property var createdNotebooks: []
   readonly property string activeType: prefix.mode === "typed" ? prefix.typeId : ""
   // What is searched: the text after a "/type", nothing while picking a type.
-  readonly property string searchText: prefix.mode === "typed" ? prefix.rest : (prefix.mode === "suggest" ? "" : root.query)
+  readonly property string searchText: prefix.mode === "typed" ? prefix.rest : (root.suggesting ? "" : root.query)
   property string requestedSearch: "\u0000"
 
   property string query: ""
@@ -94,9 +127,13 @@ Item {
   function open(payloadJson) {
     root.opened = true
     // Each open starts fresh; a stale query would hide the recent notes.
-    input.text = ""
-    root.query = ""
-    root.captureIndex = root.settings.defaultIndex
+    input.text = root.unsavedText
+    root.unsavedText = ""
+    root.query = input.text
+    root.enterPending = false
+    root.captureIndex = root.unsavedNotebook >= 0 && root.unsavedNotebook < root.notebooks.length
+      ? root.unsavedNotebook : root.settings.defaultIndex
+    root.unsavedNotebook = -1
     root.selectedIndex = 0
     root.cursorActive = false
     root.disarmPointer()
@@ -109,12 +146,13 @@ Item {
 
   function focusForPhase() {
     if (root.phase === "noZk") setupKeys.forceActiveFocus()
-    else input.forceActiveFocus()
+    else { input.forceActiveFocus(); input.cursorPosition = input.text.length }
   }
 
   onPhaseChanged: if (root.opened) Qt.callLater(root.focusForPhase)
 
   function close() {
+    root.enterPending = false
     root.opened = false
   }
 
@@ -131,20 +169,41 @@ Item {
   }
 
   function applyStatus(text) {
-    // Notebooks changed while this check ran; its answer is stale.
-    if (statusProc.pending) { Qt.callLater(root.checkStatus); return }
+    // Notebooks changed while this check ran; its answer is stale, and
+    // statusProc.onExited runs the check again.
+    if (statusProc.pending) return
     var status = Jot.parseJson(text)
-    if (!status || status.error) { root.phase = "noZk"; return }
-    if (!status.zk) { root.phase = "noZk"; return }
+    if (!status || status.error || !status.zk) {
+      root.missingTool = status && status.error && /jq/.test(String(status.error)) ? "jq" : "zk"
+      root.phase = "noZk"
+      return
+    }
     var missing = []
     var toCreate = []
+    var conflicts = []
+    for (var c = 0; c < status.notebooks.length; c++) {
+      var snb = status.notebooks[c]
+      var found = Array.isArray(snb.conflicts) ? snb.conflicts : []
+      for (var f = 0; f < found.length && conflicts.length < 50; f++) {
+        var item = found[f]
+        if (!item || typeof item.copy !== "string") continue
+        var orig = typeof item.original === "string" ? item.original : item.copy
+        conflicts.push({ label: (root.multiNotebook ? snb.name + ": " : "") + item.copy.slice(0, 120),
+                         copy: snb.path + "/" + item.copy, original: snb.path + "/" + orig,
+                         originalRel: orig })
+      }
+    }
+    root.conflicts = conflicts
     for (var i = 0; i < status.notebooks.length; i++) {
       var nb = status.notebooks[i]
       if (nb.notebook) continue
       missing.push(nb.name)
-      // A configured notebook that is not one yet is created on the spot,
-      // once per session, so the first Super+N just works.
-      if (!root.initTried[nb.path]) toCreate.push({ name: nb.name, path: nb.path })
+      // A configured notebook folder that does not exist yet (or is empty) is
+      // created on the spot, once per session, so the first open just works.
+      // An existing folder with files becomes a notebook only when asked
+      // (jot notebook add), and the home folder never does.
+      if (!root.initTried[nb.path] && (!nb.exists || nb.empty) && !nb.isHome)
+        toCreate.push({ name: nb.name, path: nb.path })
     }
     if (toCreate.length > 0) {
       root.initQueue = toCreate
@@ -228,6 +287,10 @@ Item {
       if (resultModel.count > 0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
     })
     Qt.callLater(root.runPendingSearch)
+    if (root.opened && root.enterPending && root.searchedQuery === root.searchText && !root.searchPending) {
+      root.enterPending = false
+      root.plainEnter()
+    }
   }
 
   function updatePreview() {
@@ -294,14 +357,15 @@ Item {
     if (Array.isArray(list)) {
       for (var i = 0; i < list.length && types.length < 50; i++) {
         var t = list[i]
-        if (!t || typeof t.id !== "string" || !t.id || t.id === "journal") continue
+        // "/name" is one word, so a hand-written group with a space in its
+        // name cannot be picked; leave it out rather than offer it.
+        if (!t || typeof t.id !== "string" || !t.id || t.id === "journal" || /\s/.test(t.id)) continue
         types.push({ id: t.id.slice(0, 60), label: root.typeLabel(t.id).slice(0, 60),
                      dir: String(t.dir || "").slice(0, 120), template: String(t.template || "").slice(0, 120),
                      templatePath: String(t.templatePath || "") })
       }
     }
     root.userTypes = types
-    if (typesProc.pending) Qt.callLater(root.fetchTypes)
   }
 
   function moveSuggestion(delta) {
@@ -385,6 +449,8 @@ Item {
     var text = (root.activeType ? root.prefix.rest : input.text).replace(/\s+$/, "")
     if (!text.trim() && !type) return
     var nb = root.captureNotebook
+    actionProc.notebookIndex = root.captureIndex
+    actionProc.typePrefix = root.activeType ? input.text.slice(0, input.text.length - root.prefix.rest.length) : ""
     actionProc.kind = kind
     actionProc.openAfter = openAfter
     actionProc.notebookName = nb.name
@@ -393,6 +459,7 @@ Item {
       .concat(root.folderArgs(kind))
       .concat(root.dateArgs())
       .concat(["--", text])
+    actionProc.text = text
     actionProc.running = true
     input.text = ""
     root.close()
@@ -401,7 +468,11 @@ Item {
   function finishAction(text) {
     var result = Jot.parseJson(text)
     if (!result || result.error || !result.path) {
-      root.notify(strings.t("error.title"), result && result.error ? String(result.error) : strings.t("error.unknown"))
+      // Keep what was typed: the next open puts it back.
+      root.unsavedText = (root.activeTypePrefixFor(actionProc) + actionProc.text)
+      root.unsavedNotebook = actionProc.notebookIndex
+      root.notify(strings.t("error.title"), (result && result.error ? String(result.error) : strings.t("error.unknown"))
+                  + " " + strings.t("error.kept"))
       return
     }
     if (actionProc.openAfter) {
@@ -417,17 +488,18 @@ Item {
   // The editor from Jot's settings, or Omarchy's default editor. A terminal
   // editor gets a terminal window, the way omarchy-launch-editor does it.
   function openInEditor(path) {
+    var paths = Array.isArray(path) ? path : [path]
     var editor = root.settings.editor
     if (!editor) {
-      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-launch-editor", path])
+      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-launch-editor"].concat(paths))
       return
     }
     var argv = editor.split(/\s+/).filter(function(a) { return a.length > 0 })
-    var tui = ["nvim", "vim", "vi", "nano", "micro", "hx", "helix", "kak", "emacs"]
+    var tui = ["nvim", "vim", "vi", "nano", "micro", "hx", "helix", "kak", "emacs", "fresh"]
     if (tui.indexOf(argv[0].replace(/^.*\//, "")) >= 0)
-      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-launch-tui"].concat(argv).concat(["--", path]))
+      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-launch-tui"].concat(argv).concat(["--"]).concat(paths))
     else
-      Quickshell.execDetached(argv.concat([path]))
+      Quickshell.execDetached(argv.concat(paths))
   }
 
   function openSettings() {
@@ -442,6 +514,8 @@ Item {
     if (kind === "daily" && !root.settings.journalTimestamps) args.push("--no-timestamps")
     return args
   }
+
+  function activeTypePrefixFor(proc) { return proc.typePrefix || "" }
 
   // Notification text is markup in some daemons; keep it inert.
   function notify(summary, body) {
@@ -484,7 +558,20 @@ Item {
   function installZk() {
     root.close()
     Quickshell.execDetached(["xdg-terminal-exec", "bash", "-c",
-      "omarchy-pkg-add zk && echo && echo 'zk is installed. Press Super+N again to start using Jot.' || echo 'Installing zk failed.'; read -rsn1 -p 'Press any key to close'"])
+      "omarchy-pkg-add zk jq && echo && echo 'Done. Open Jot again to start.' || echo 'Installing failed.'; read -rsn1 -p 'Press any key to close'"])
+  }
+
+  function plainEnter() {
+    if (root.cursorActive && resultModel.count > 0) root.openRow(root.selectedRow())
+    else if (root.captureText().trim()) root.runAction(root.defaultKind, false)
+  }
+
+  // Physical keys (xkb scan codes on a US layout), so Ctrl shortcuts work
+  // with any keyboard layout: Ctrl+K on a Russian layout arrives as Ctrl+Л.
+  readonly property var scanCodes: ({ Comma: 59, E: 26, K: 45, P: 33, N: 57 })
+  function isKey(event, name) {
+    if (!(event.modifiers & Qt.ControlModifier)) return false
+    return event.key === Qt["Key_" + name] || event.nativeScanCode === root.scanCodes[name]
   }
 
   function handleKey(event) {
@@ -493,13 +580,15 @@ Item {
     var shift = event.modifiers & Qt.ShiftModifier
     var enter = event.key === Qt.Key_Return || event.key === Qt.Key_Enter
 
+    if (!(event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) root.enterPending = false
+
     if (event.key === Qt.Key_Escape) {
       if (input.text) input.text = ""
       else root.close()
       return true
     }
 
-    if (ctrl && event.key === Qt.Key_Comma) { root.openSettings(); return true }
+    if (root.isKey(event, "Comma")) { root.openSettings(); return true }
 
     if (root.phase === "noZk") {
       if (enter) { root.installZk(); return true }
@@ -507,15 +596,16 @@ Item {
     }
     if (root.phase !== "ready") return enter || event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab
 
-    if (ctrl && event.key === Qt.Key_E) { root.editTemplate(); return true }
+    if (root.isKey(event, "E")) { root.editTemplate(); return true }
+    if (root.isKey(event, "K")) { root.openConflict(); return true }
 
     if (root.suggesting) {
       if (enter || event.key === Qt.Key_Tab) {
         if (root.suggestions.length > 0) root.completeType(root.suggestionIndex)
         return true
       }
-      if (event.key === Qt.Key_Up || (ctrl && event.key === Qt.Key_P)) { root.moveSuggestion(-1); return true }
-      if (event.key === Qt.Key_Down || (ctrl && event.key === Qt.Key_N)) { root.moveSuggestion(1); return true }
+      if (event.key === Qt.Key_Up || (root.isKey(event, "P"))) { root.moveSuggestion(-1); return true }
+      if (event.key === Qt.Key_Down || (root.isKey(event, "N"))) { root.moveSuggestion(1); return true }
       return false
     }
 
@@ -530,8 +620,9 @@ Item {
     if (enter) {
       if (alt) { root.runAction(root.otherKind, false); return true }
       if (ctrl) { root.runAction(shift ? "new" : root.defaultKind, shift); return true }
-      if (root.cursorActive && resultModel.count > 0) root.openRow(root.selectedRow())
-      else if (root.captureText().trim()) root.runAction(root.defaultKind, false)
+      // Results still belong to an earlier query: decide once they catch up.
+      if (root.searching || root.searchText !== root.searchedQuery) { root.enterPending = true; return true }
+      root.plainEnter()
       return true
     }
     if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
@@ -542,8 +633,8 @@ Item {
     if (event.key === Qt.Key_Down) { root.select(1); return true }
     if (event.key === Qt.Key_PageUp) { root.select(-6); return true }
     if (event.key === Qt.Key_PageDown) { root.select(6); return true }
-    if (ctrl && event.key === Qt.Key_P) { root.select(-1); return true }
-    if (ctrl && event.key === Qt.Key_N) { root.select(1); return true }
+    if (root.isKey(event, "P")) { root.select(-1); return true }
+    if (root.isKey(event, "N")) { root.select(1); return true }
     return false
   }
 
@@ -564,7 +655,7 @@ Item {
       }).join("+")
       root.notify(strings.t("setup.ready"), strings.t("setup.readyBody").arg(keys))
     } else {
-      root.notify(strings.t("setup.ready"), strings.t("setup.noShortcut"))
+      root.notify(strings.t("setup.ready"), strings.t(result.bindingsFound === false ? "setup.noBindings" : "setup.noShortcut"))
     }
   }
 
@@ -591,12 +682,20 @@ Item {
     path: root.configPath
     watchChanges: true
     printErrors: false
-    onLoaded: root.settings = Jot.parseConfig(text(), root.home)
-    onLoadFailed: root.settings = Jot.parseConfig("", root.home)
+    onLoaded: root.applyConfig(text())
+    onLoadFailed: root.applyConfig("")
     onFileChanged: reload()
   }
 
   onCaptureIndexChanged: root.fetchTypes()
+
+  // Reloading the same file must not look like new settings: that would
+  // restart the status check on every open.
+  function applyConfig(text) {
+    if (text === root.lastConfigText) return
+    root.lastConfigText = text
+    root.settings = Jot.parseConfig(text, root.home)
+  }
 
   onNotebooksChanged: {
     if (root.captureIndex >= root.notebooks.length) root.captureIndex = root.settings.defaultIndex
@@ -613,6 +712,7 @@ Item {
   Process {
     id: statusProc
     property bool pending: false
+    onExited: if (statusProc.pending) Qt.callLater(root.checkStatus)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyStatus(text)
@@ -640,6 +740,7 @@ Item {
   Process {
     id: typesProc
     property bool pending: false
+    onExited: if (typesProc.pending) Qt.callLater(root.fetchTypes)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyTypes(text)
@@ -648,6 +749,9 @@ Item {
 
   Process {
     id: actionProc
+    property string text: ""
+    property string typePrefix: ""
+    property int notebookIndex: -1
     property string kind: ""
     property bool openAfter: false
     property string notebookName: ""
@@ -735,7 +839,7 @@ Item {
         // ---- input line
         Item {
           id: header
-          visible: root.phase === "ready"
+          visible: root.phase !== "noZk"
           width: parent.width
           height: Math.max(Style.space(34), Math.min(input.contentHeight, input.font.pixelSize * 5.2)) + Style.spacing.controlPaddingY
 
@@ -963,6 +1067,8 @@ Item {
                   required property string relPath
                   required property string tags
                   required property string modified
+                  required property string absPath
+                  readonly property var conflict: { root.conflicts; return root.conflictOf(absPath) }
                   readonly property bool hasCursor: root.cursorActive && index === root.selectedIndex
                   readonly property color textColor: hasCursor ? root.selectedText : root.foreground
 
@@ -982,7 +1088,7 @@ Item {
                     Text {
                       textFormat: Text.PlainText
                       width: parent.width
-                      text: row.title
+                      text: (row.conflict ? "⚠ " : "") + row.title
                       color: row.textColor
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.title
@@ -994,6 +1100,7 @@ Item {
                       width: parent.width
                       text: {
                         var parts = []
+                        if (row.conflict) parts.push(strings.t(row.conflict.role === "copy" ? "conflict.copyTag" : "conflict.originalTag"))
                         if (root.multiNotebook) parts.push(row.notebook)
                         var when = Jot.relativeDate(row.modified, Qt.locale(Commons.I18n.formatLocale),
                                                     strings.t("date.today"), strings.t("date.yesterday"))
@@ -1042,7 +1149,7 @@ Item {
                 anchors.fill: parent
                 anchors.leftMargin: root.contentMargin
                 contentWidth: width
-                contentHeight: previewText.implicitHeight
+                contentHeight: previewColumn.implicitHeight
                 clip: true
                 boundsBehavior: Flickable.StopAtBounds
 
@@ -1053,9 +1160,28 @@ Item {
 
                 // Markdown from disk, made inert by Jot.sanitizeMarkdown: no raw
                 // HTML, no images, no remote resources. Links are not followed.
+                Column {
+                  id: previewColumn
+                  width: previewFlick.width
+                  spacing: Style.space(8)
+
+                Text {
+                  readonly property var hit: { root.conflicts; return root.conflictOf(root.previewPath) }
+                  visible: hit !== null
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  text: !hit ? "" : (hit.role === "copy"
+                        ? strings.t("conflict.isCopy").arg(hit.conflict.originalRel)
+                        : strings.t("conflict.hasCopy").arg(hit.conflict.label))
+                  color: Commons.Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
                 Text {
                   id: previewText
-                  width: previewFlick.width
+                  width: parent.width
                   textFormat: Text.MarkdownText
                   text: Jot.sanitizeMarkdown(root.previewContent)
                   color: root.foreground
@@ -1063,6 +1189,7 @@ Item {
                   font.family: Style.font.family
                   font.pixelSize: Style.font.body
                   wrapMode: Text.Wrap
+                }
                 }
               }
             }
@@ -1105,7 +1232,7 @@ Item {
         Item {
           width: parent.width
           height: parent.height - footer.height - root.contentSpacing
-          visible: root.phase !== "ready"
+          visible: root.phase === "noZk"
 
           Column {
             anchors.centerIn: parent
@@ -1131,7 +1258,7 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               font.bold: true
-              text: root.phase === "noZk" ? strings.t("setup.noZk.title") : ""
+              text: root.phase === "noZk" ? strings.t("setup.noZk.title").arg(root.missingTool) : ""
             }
 
             Text {
@@ -1143,7 +1270,7 @@ Item {
               opacity: 0.7
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
-              text: root.phase === "noZk" ? strings.t("setup.noZk.body") : ""
+              text: root.phase === "noZk" ? strings.t(root.missingTool === "jq" ? "setup.noJq.body" : "setup.noZk.body") : ""
             }
 
             Button {
@@ -1151,7 +1278,7 @@ Item {
               anchors.horizontalCenter: parent.horizontalCenter
               bordered: true
               iconText: "󰏗"
-              text: strings.t("setup.noZk.button")
+              text: strings.t("setup.noZk.button").arg(root.missingTool)
               onClicked: root.installZk()
             }
           }
@@ -1178,9 +1305,15 @@ Item {
             }
             if (root.activeType === "journal") return strings.t("hint.typedJournal")
             if (root.activeType) return strings.t("hint.typed").arg(root.typeLabel(root.activeType))
-            var hint = root.defaultKind === "daily" ? strings.t("hint.readyJournal") : strings.t("hint.ready")
+            // Empty input: point at types and settings. Typing: at the keys
+            // that act on the text, new line included.
+            var typing = input.text.length > 0
+            var hint = strings.t((root.defaultKind === "daily" ? "hint.readyJournal" : "hint.ready") + (typing ? "Typing" : ""))
             if (root.multiNotebook) hint += "  ·  " + strings.t("hint.notebook")
             if (root.missingNotebooks.length > 0) hint += "  ·  " + strings.t("hint.missing").arg(root.missingNotebooks.join(", "))
+            // A sync conflict matters more than the key hints: say it first.
+            if (root.conflicts.length > 0)
+              hint = strings.tn("hint.conflicts", root.conflicts.length).arg(Commons.I18n.formatNumber(root.conflicts.length)).arg(root.conflicts[0].label) + "  ·  " + hint
             return hint
           }
         }

@@ -55,32 +55,34 @@ test("broken config falls back and says so", () => {
   assert.strictEqual(s.ok, false); assert.strictEqual(s.notebooks.length, 1)
 })
 
-test("raw HTML in a preview is escaped", () => {
-  const out = Jot.sanitizeMarkdown('hi <img src="https://example.invalid/tracker"> there')
-  assert.ok(!/(^|[^\\])<img/.test(out), out)
-})
+// No "<" may be followed by a tag or autolink start, and no "![" may survive.
+function inert(out) {
+  return !/<[A-Za-z!/?]/.test(out) && !out.includes("![")
+}
 
-test("images become alt text", () => {
-  const out = Jot.sanitizeMarkdown("![cat](https://example.invalid/cat.png) and ![](x.png)")
-  assert.ok(!out.includes("!["), out)
-  assert.ok(out.includes("▣ cat"), out)
-})
+const ATTACKS = {
+  "raw html": 'hi <img src="https://example.invalid/tracker"> there',
+  "image": "![cat](https://example.invalid/cat.png)",
+  "nested brackets": "![a [b] c](http://example.invalid/x.png)",
+  "url on the next line": "![a](\nhttp://example.invalid/x.png)",
+  "reference on the next line": "![r]\n\n[r]:\n  http://example.invalid/x.png",
+  "reference in a blockquote": "![r]\n\n> [r]: http://example.invalid/x.png",
+  "html in a list item": "- item\n\n    <img src=http://example.invalid/x>",
+  "backtick in info string": "``` x`\n<img src=http://example.invalid/x>\n```",
+  "fence closed by a list": "- a\n  ```\n<img src=http://example.invalid/x>",
+  "autolink": "<http://example.invalid/x>",
+  "html comment": "<!-- x --><iframe src=http://example.invalid>",
+}
+for (const [name, md] of Object.entries(ATTACKS)) {
+  test("preview is inert: " + name, () => {
+    const out = Jot.sanitizeMarkdown(md)
+    assert.ok(inert(out), JSON.stringify(out))
+  })
+}
 
-test("reference image definitions are neutralized", () => {
-  const out = Jot.sanitizeMarkdown("![a][r]\n\n[r]: https://example.invalid/t.png")
-  assert.ok(!out.includes("example.invalid"), out)
-})
-
-test("code blocks are left literal", () => {
-  const md = "```\n<div>&amp;</div>\n```\n`<b>` inline"
-  const out = Jot.sanitizeMarkdown(md)
-  assert.ok(out.includes("```\n<div>&amp;</div>\n```"), out)
-  assert.ok(out.includes("`<b>`"), out)
-})
-
-test("unclosed backtick does not shield HTML", () => {
-  const out = Jot.sanitizeMarkdown("a ` <img src=x>")
-  assert.ok(out.includes("\\<img"), out)
+test("the preview reads the same once the invisible spaces are ignored", () => {
+  const md = "```\n<div>&amp;</div>\n```\n`<b>` and a < b, wow!\n[link](http://x)"
+  assert.strictEqual(Jot.sanitizeMarkdown(md).replace(/​/g, ""), md)
 })
 
 test("front matter is hidden", () => {
@@ -129,7 +131,7 @@ test("text without a slash is untouched", () => {
 
 test("type names follow bin/jot's rule", () => {
   for (const ok of ["рецепт", "idea", "ok-name_1"]) assert.ok(Jot.validTypeName(ok), ok)
-  for (const bad of ["", "a/b", "a.b", "two words", "journal", '"q', "x]", "a\\b", "it's", "a=b", "x".repeat(41)])
+  for (const bad of ["", "a/b", "a.b", "two words", "journal", '"q', "x]", "a\\b", "it's", "a=b", "a:b", "a*", "a?", "a<b", "a>b", "a|b", "-x", "x".repeat(41)])
     assert.ok(!Jot.validTypeName(bad), bad)
 })
 

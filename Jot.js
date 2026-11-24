@@ -117,7 +117,7 @@ function parseConfig(text, home) {
   }
   if (typeof config.defaultNotebook === "string") {
     for (var k = 0; k < result.notebooks.length; k++)
-      if (result.notebooks[k].name === config.defaultNotebook) { result.defaultIndex = k; break }
+      if (result.notebooks[k].name === config.defaultNotebook.trim().slice(0, MAX_NAME_CHARS)) { result.defaultIndex = k; break }
   }
   result.inboxFolder = safeFolder(config.inboxFolder, DEFAULTS.inboxFolder)
   result.journalFolder = safeFolder(config.journalFolder, DEFAULTS.journalFolder) || DEFAULTS.journalFolder
@@ -145,50 +145,19 @@ function stripFrontmatter(text) {
   return after < 0 ? "" : text.slice(after + 1)
 }
 
-// Escapes what Qt's Markdown renderer would otherwise act on in a preview
-// that must stay inert: raw HTML (an <img> would load a remote resource) and
-// images (rendered as their alt text instead). Code is left alone, since the
-// renderer shows it literally anyway.
-function escapeInline(line) {
-  var out = ""
-  var parts = line.split("`")
-  for (var i = 0; i < parts.length; i++) {
-    var part = parts[i]
-    // Odd segments sit between backticks (inline code) when the backtick closes.
-    var isCode = i % 2 === 1 && i < parts.length - 1
-    if (!isCode) {
-      part = part.replace(/!\[([^\]]*)\]\([^)]*\)/g, function(m, alt) { return "▣ " + (alt || "image") })
-      part = part.replace(/!\[([^\]]*)\]\[[^\]]*\]/g, function(m, alt) { return "▣ " + (alt || "image") })
-      part = part.replace(/</g, "\\<").replace(/&/g, "\\&")
-    }
-    out += (i > 0 ? "`" : "") + part
-  }
-  return out
-}
+// Makes a note safe to hand to Qt's Markdown renderer. A preview must stay
+// inert: no raw HTML (an <img> would load a remote resource) and no images.
+// Parsing Markdown well enough to find them is a losing game (nested
+// brackets, lists, blockquotes, fences), so this does not try: a zero-width
+// space after every "<" means no tag or autolink can start, and one between
+// "!" and "[" means no image can. It is invisible on screen, code included.
+var ZWSP = "​"
 
 function sanitizeMarkdown(text) {
   text = String(text || "").replace(/\r\n?/g, "\n")
   if (text.length > MAX_PREVIEW_CHARS) text = text.slice(0, MAX_PREVIEW_CHARS) + "\n\n…"
   text = stripFrontmatter(text)
-
-  var lines = text.split("\n")
-  var fence = null
-  for (var i = 0; i < lines.length; i++) {
-    var line = lines[i]
-    var m = line.match(/^\s{0,3}(`{3,}|~{3,})/)
-    if (m) {
-      if (fence === null) fence = m[1].charAt(0)
-      else if (m[1].charAt(0) === fence) fence = null
-      continue
-    }
-    if (fence !== null) continue
-    // Four-space indented code is literal too.
-    if (/^(    |\t)/.test(line) && (i === 0 || lines[i - 1].trim() === "" || /^(    |\t)/.test(lines[i - 1]))) continue
-    // Reference-style image definitions would still resolve; neutralize them.
-    lines[i] = escapeInline(line).replace(/^(\s{0,3})\[([^\]]+)\]:\s*\S+/, "$1[$2]: …")
-  }
-  // [[wiki links]] read better as plain bracketed text than as nested links.
-  return lines.join("\n")
+  return text.replace(/</g, "<" + ZWSP).replace(/!\[/g, "!" + ZWSP + "[")
 }
 
 function displayTitle(note) {
@@ -247,6 +216,7 @@ function parseTypePrefix(text, types) {
 // the characters that would break a TOML key, a folder or a file name.
 function validTypeName(name) {
   name = String(name || "")
-  if (!name || name.length > 40 || name === "journal") return false
-  return !/[\s"\\\/.#\[\]'=\u0000-\u001f]/.test(name)
+  if (!name || name.length > 40 || name === "journal" || name.charAt(0) === "-") return false
+  // Windows' forbidden characters too: notebooks get synced there.
+  return !/[\s"\\\/.#\[\]'=:*?<>|\u0000-\u001f]/.test(name)
 }

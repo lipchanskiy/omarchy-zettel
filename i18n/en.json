@@ -6,9 +6,9 @@
   "date.yesterday": "Yesterday",
   "hint.ready": "Enter open  ·  Ctrl+Enter new note  ·  Alt+Enter journal  ·  / types  ·  Ctrl+, settings",
   "hint.notebook": "Tab notebook",
-  "hint.missing": "Not found: %1",
-  "hint.install": "Enter install zk  ·  Esc close",
-  "setup.noZk.title": "Jot needs zk",
+  "hint.missing": "Not a notebook yet: %1 (jot init PATH)",
+  "hint.install": "Enter install  ·  Esc close",
+  "setup.noZk.title": "Jot needs %1",
   "setup.noZk.body": "zk is the note tool Jot is built on. Install it in a terminal; it takes a few seconds.",
   "saved.note": "Note saved",
   "saved.daily": "Added to today's journal",
@@ -24,7 +24,7 @@
   "hint.readyJournal": "Enter open  ·  Ctrl+Enter journal  ·  Alt+Enter new note  ·  / types  ·  Ctrl+, settings",
   "hint.createType": "Enter create this type  ·  ↑↓ move  ·  Esc clear",
   "hint.typedJournal": "Enter add to today's journal  ·  Shift+Enter new line",
-  "setup.noZk.button": "Install zk",
+  "setup.noZk.button": "Install %1",
   "types.create": "Create type “%1”",
   "types.createHint": "Adds a folder and a template you can shape with Ctrl+E",
   "types.journalHint": "One note per day in %1, entries with the time",
@@ -36,5 +36,19 @@
   "error.type": "Jot could not create the note type",
   "setup.ready": "Jot is ready",
   "setup.readyBody": "Press %1 to find and capture notes.",
-  "setup.noShortcut": "No free shortcut was found. Bind one to lipchanskiy.jot, see the README."
+  "setup.noShortcut": "Every shortcut Jot tries is taken. Bind one to lipchanskiy.jot, see the README.",
+  "types.help": "Types are the zk groups and templates of the notebook, in .zk/config.toml and .zk/templates.",
+  "setup.noJq.body": "jq is a small JSON tool Jot uses to talk to zk. Install it in a terminal; it takes a few seconds.",
+  "error.kept": "Your text is kept: open Jot to try again.",
+  "setup.noBindings": "~/.config/hypr/bindings.lua was not found, so no shortcut was added. See the README.",
+  "hint.conflicts": {
+    "one": "⚠ %1 sync conflict: %2 — Ctrl+K to compare",
+    "other": "⚠ %1 sync conflicts, first: %2 — Ctrl+K to compare"
+  },
+  "hint.readyTyping": "Enter open  ·  Ctrl+Enter new note  ·  Alt+Enter journal  ·  Shift+Enter new line",
+  "hint.readyJournalTyping": "Enter open  ·  Ctrl+Enter journal  ·  Alt+Enter new note  ·  Shift+Enter new line",
+  "conflict.copyTag": "conflict copy",
+  "conflict.originalTag": "has a conflict copy",
+  "conflict.isCopy": "⚠ Sync conflict copy of %1. Ctrl+K opens both: move what you need into the original, then delete this file.",
+  "conflict.hasCopy": "⚠ This note has a sync conflict copy: %1. Ctrl+K opens both: move what you need here, then delete the copy."
 }
