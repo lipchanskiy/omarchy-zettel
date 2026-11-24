@@ -1,6 +1,6 @@
 .pragma library
 
-// Pure helpers for Jot.qml. Kept free of QML types so tests/run.js can load
+// Pure helpers for Zettel.qml. Kept free of QML types so tests/run.js can load
 // this file in node and check them directly.
 
 var MAX_PREVIEW_CHARS = 20000
@@ -20,7 +20,7 @@ function baseName(path) {
 }
 
 // JSONC → JSON: drops // and /* */ comments and trailing commas, leaving
-// string contents (paths, URLs) alone. Mirrors strip_jsonc in bin/jot.
+// string contents (paths, URLs) alone. Mirrors strip_jsonc in bin/zettel.
 function stripJsonc(text) {
   text = String(text || "")
   var out = ""
@@ -81,7 +81,7 @@ function safeFolder(value, fallback) {
 
 var DEFAULTS = { inboxFolder: "inbox", journalFolder: "journal", journalTimestamps: true, editor: "", defaultCapture: "note" }
 
-// Reads ~/.config/jot/config.jsonc (see bin/jot for the commented template).
+// Reads ~/.config/zettel/config.jsonc (see bin/zettel for the commented template).
 // Anything missing or malformed falls back to one ~/Notes notebook and the
 // defaults above; ok is false when the file exists but does not parse.
 function parseConfig(text, home) {
@@ -212,7 +212,7 @@ function parseTypePrefix(text, types) {
   return none
 }
 
-// Same rule as add_type in bin/jot: one word, at most 40 characters, none of
+// Same rule as add_type in bin/zettel: one word, at most 40 characters, none of
 // the characters that would break a TOML key, a folder or a file name.
 function validTypeName(name) {
   name = String(name || "")

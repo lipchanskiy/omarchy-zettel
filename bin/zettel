@@ -1,29 +1,29 @@
 #!/bin/bash
-# jot: a thin, stateless wrapper around zk for the lipchanskiy.jot shell plugin.
+# zettel: a thin, stateless wrapper around zk for the lipchanskiy.zettel shell plugin.
 #
 # Every command prints one JSON document on stdout, so the QML side never has
 # to parse zk's human output. Notebooks are passed in as --nb NAME PATH pairs;
 # the script keeps no configuration of its own.
 #
-#   jot status   --nb NAME PATH...            zk presence and each notebook's state
-#   jot search   [--limit N] --nb NAME PATH... -- QUERY
-#   jot new      --nb NAME PATH -- TEXT       create a note (first line is the title)
-#   jot daily    --nb NAME PATH -- TEXT       append a timestamped entry to today's journal
-#   jot types    --nb NAME PATH               note types (zk groups and templates) of a notebook
-#   jot types    add TYPE --nb NAME PATH      add a note type: a group with its own folder and template
-#   jot init     PATH                         create a notebook with Jot's defaults, or make an
+#   zettel status   --nb NAME PATH...            zk presence and each notebook's state
+#   zettel search   [--limit N] --nb NAME PATH... -- QUERY
+#   zettel new      --nb NAME PATH -- TEXT       create a note (first line is the title)
+#   zettel daily    --nb NAME PATH -- TEXT       append a timestamped entry to today's journal
+#   zettel types    --nb NAME PATH               note types (zk groups and templates) of a notebook
+#   zettel types    add TYPE --nb NAME PATH      add a note type: a group with its own folder and template
+#   zettel init     PATH                         create a notebook with Zettel's defaults, or make an
 #                                             existing one safe to sync (.gitignore, .stignore, .gitattributes)
-#   jot notebook list|add NAME PATH|remove NAME|default NAME
-#                                             manage the notebooks in Jot's config
-#   jot config [path]                         create the config if missing, print its path
-#   jot setup [--first-run] [--remove]        shortcut, `jot` command and config (see cmd_setup)
+#   zettel notebook list|add NAME PATH|remove NAME|default NAME
+#                                             manage the notebooks in Zettel's config
+#   zettel config [path]                         create the config if missing, print its path
+#   zettel setup [--check|--no-shortcut|--remove] shortcut, `zettel` command and config (see cmd_setup)
 #
-# Jot's settings live in ${XDG_CONFIG_HOME:-~/.config}/jot/config.jsonc. The
+# Zettel's settings live in ${XDG_CONFIG_HOME:-~/.config}/zettel/config.jsonc. The
 # window reads them itself and passes what a command needs as options:
 # --inbox DIR and --journal DIR (folders inside the notebook) and
 # --no-timestamps for daily.
 #
-# new and daily also take --type ID (a type from `jot types`), --title-label
+# new and daily also take --type ID (a type from `zettel types`), --title-label
 # (the journal heading) and --date/--weekday (localized date parts handed to
 # templates as {{extra.date}} and {{extra.weekday}}), all formatted by the
 # shell in the user's language.
@@ -112,7 +112,7 @@ while (($#)); do
     [[ -n $journal_dir ]] || journal_dir="journal"
     shift 2
     ;;
-  --first-run | --remove)
+  --check | --no-shortcut | --remove)
     positional+=("$1")
     shift
     ;;
@@ -267,7 +267,7 @@ cmd_search() {
   # Nothing at all? Try once more, forgiving endings and е/ё.
   local total=0 l
   for l in "${lists[@]}"; do total=$((total + $(jq length <<<"$l"))); done
-  if ((total == 0)) && [[ -n ${text//[[:space:]]/} && -z ${JOT_NO_FUZZY:-} ]]; then
+  if ((total == 0)) && [[ -n ${text//[[:space:]]/} && -z ${ZETTEL_NO_FUZZY:-} ]]; then
     build_fuzzy_filters "$text"
     if ((${#fuzzy_args[@]})); then
       local tag_args=() k
@@ -367,16 +367,16 @@ cmd_types() {
   case ${positional[0]:-list} in
   list) types_json "$root" ;;
   add)
-    ((${#positional[@]} == 2)) || die "usage: jot types add TYPE --nb NAME PATH"
+    ((${#positional[@]} == 2)) || die "usage: zettel types add TYPE --nb NAME PATH"
     add_type "$root" "${positional[1]}"
     ;;
-  *) die "usage: jot types [add TYPE] --nb NAME PATH" ;;
+  *) die "usage: zettel types [add TYPE] --nb NAME PATH" ;;
   esac
 }
 
 # A new type is a zk group with a folder and a template of the same name,
 # appended to the notebook's config. The template starts as a plain title +
-# text note; the user shapes it from there (Ctrl+E in Jot opens it).
+# text note; the user shapes it from there (Ctrl+E in Zettel opens it).
 add_type() {
   local root=$1 name=$2 cfg=$1/.zk/config.toml
   local c bad=false
@@ -396,7 +396,7 @@ add_type() {
     printf '# {{title}}\n\n{{content}}\n' >"$tpl" || die "cannot write $tpl"
   fi
   {
-    printf '\n# Note type added by Jot. Shape its template in .zk/templates/%s.md\n' "$name"
+    printf '\n# Note type added by Zettel. Shape its template in .zk/templates/%s.md\n' "$name"
     printf '[group."%s"]\npaths = ["%s"]\n\n[group."%s".note]\ntemplate = "%s.md"\n' "$name" "$name" "$name" "$name"
   } >>"$cfg" || die "cannot update $cfg"
   types_json "$root" | jq -c --arg id "$name" '.[] | select(.id == $id)'
@@ -490,7 +490,7 @@ cmd_daily() {
   mkdir -p "$root/$journal_dir" || die "cannot create journal folder"
   file=$root/$journal_dir/$day.md
 
-  # Jot writes the day's heading itself: the journal folder is a setting, and
+  # Zettel writes the day's heading itself: the journal folder is a setting, and
   # zk would name a note in a folder outside its journal group differently.
   if [[ ! -f $file ]]; then
     printf '# %s\n' "$heading" >"$file" || die "cannot write journal"
@@ -533,19 +533,19 @@ ensure_sync_files() {
   local root=$1
   {
     if [[ ! -f $root/.gitignore ]] || ! grep -q 'notebook.db' "$root/.gitignore"; then
-      ensure_line "$root/.gitignore" "# zk's index is rebuilt on each machine; never sync it (added by Jot)"
+      ensure_line "$root/.gitignore" "# zk's index is rebuilt on each machine; never sync it (added by Zettel)"
     fi
     ensure_line "$root/.gitignore" ".zk/notebook.db*"
-    ensure_line "$root/.stignore" "// zk's index is rebuilt on each machine; never sync it (added by Jot)" >/dev/null
+    ensure_line "$root/.stignore" "// zk's index is rebuilt on each machine; never sync it (added by Zettel)" >/dev/null
     ensure_line "$root/.stignore" "/.zk/notebook.db*"
     ensure_line "$root/.gitattributes" "*.md text eol=lf"
     ensure_line "$root/.gitattributes" "journal/*.md merge=union"
   } | sort -u
 }
 
-# Brings a notebook Jot made earlier up to what zk users on other machines
+# Brings a notebook Zettel made earlier up to what zk users on other machines
 # expect, without touching anything the user changed: the journal template
-# gets a date when it is still Jot's old "# {{title}}", and `zk daily` is
+# gets a date when it is still Zettel's old "# {{title}}", and `zk daily` is
 # added when the config has no [alias] table yet (adding a key to an
 # existing table could not be done safely line by line).
 ensure_zk_compat() {
@@ -556,7 +556,7 @@ ensure_zk_compat() {
   if [[ -f $cfg ]] && ! grep -qE '^[[:space:]]*\[alias\]' "$cfg"; then
     {
       printf '\n[alias]\n'
-      printf '%s\n' "# \`zk daily\` opens today's journal, the same file Jot's Alt+Enter writes to."
+      printf '%s\n' "# \`zk daily\` opens today's journal, the same file Zettel's Alt+Enter writes to."
       printf '%s\n' "daily = 'zk new --no-input \"\$ZK_NOTEBOOK_DIR/journal\"'"
     } >>"$cfg" && echo "config.toml"
   fi
@@ -594,11 +594,11 @@ do_init() {
   mkdir -p "$root/.zk/templates" "$root/inbox" "$root/journal" || die "cannot create $root"
 
   cat >"$root/.zk/config.toml" <<'EOF'
-# Notebook created by Jot (lipchanskiy.jot). Everything here is plain zk
+# Notebook created by Zettel (lipchanskiy.zettel). Everything here is plain zk
 # configuration: https://zk-org.github.io/zk/config/config.html
 #
-# Every [group.NAME] (except journal) is a note type in Jot: type /NAME in
-# the Jot window to use one. Typing /NAME for a type that does not exist yet
+# Every [group.NAME] (except journal) is a note type in Zettel: type /NAME in
+# the Zettel window to use one. Typing /NAME for a type that does not exist yet
 # offers to create it, which adds a group like the commented example below.
 #
 # [group."idea"]
@@ -635,7 +635,7 @@ wiki-title = "hint"
 dead-link = "error"
 
 [alias]
-# `zk daily` opens today's journal, the same file Jot's Alt+Enter writes to.
+# `zk daily` opens today's journal, the same file Zettel's Alt+Enter writes to.
 daily = 'zk new --no-input "$ZK_NOTEBOOK_DIR/journal"'
 EOF
 
@@ -645,7 +645,7 @@ EOF
 {{content}}
 EOF
 
-  # Jot writes the day's heading itself; this template is for zk and its
+  # Zettel writes the day's heading itself; this template is for zk and its
   # editor plugins (`zk daily`), which make the day's note without a title.
   cat >"$root/.zk/templates/journal.md" <<'EOF'
 # {{format-date now '%Y-%m-%d'}}
@@ -666,10 +666,10 @@ cmd_init() {
 
 # --- config ----------------------------------------------------------------
 
-CONFIG_FILE=${JOT_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/jot/config.jsonc}
+CONFIG_FILE=${ZETTEL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/zettel/config.jsonc}
 
 # JSONC → JSON: drops // and /* */ comments, then trailing commas, leaving
-# string contents alone. Mirrors stripJsonc in Jot.js.
+# string contents alone. Mirrors stripJsonc in Zettel.js.
 strip_jsonc() {
   awk '
     { buf = buf $0 "\n" }
@@ -725,21 +725,21 @@ write_config() {
   local c=$1 notebooks
   notebooks=$(jq -r '.notebooks | map("    " + ({name, path} | tojson)) | join(",\n")' <<<"$c")
   replace_file "$CONFIG_FILE" <<EOF || die "cannot write $CONFIG_FILE"
-// Jot settings. Changes apply as soon as you save; no restart needed.
-// Open this file from the Jot window with Ctrl+, (Ctrl+comma).
+// Zettel settings. Changes apply as soon as you save; no restart needed.
+// Open this file from the Zettel window with Ctrl+, (Ctrl+comma).
 //
-// The shortcut that opens Jot (Super+N) is set in ~/.config/hypr/bindings.lua.
-// \`jot notebook add|remove|default\` rewrites this file from the template
+// The shortcut that opens Zettel (Super+N) is set in ~/.config/hypr/bindings.lua.
+// \`zettel notebook add|remove|default\` rewrites this file from the template
 // below, so comments you add yourself may not survive it.
 {
-  // Notebooks Jot searches and writes to. Each is a folder of Markdown notes
+  // Notebooks Zettel searches and writes to. Each is a folder of Markdown notes
   // managed by zk (https://zk-org.github.io/zk/). Paths may start with ~.
-  // To add one and create it if needed: jot notebook add NAME PATH
+  // To add one and create it if needed: zettel notebook add NAME PATH
   "notebooks": [
 $notebooks
   ],
 
-  // The notebook new notes and journal entries go to. Press Tab in the Jot
+  // The notebook new notes and journal entries go to. Press Tab in the Zettel
   // window to pick another one for a single note. Must match a name above.
   "defaultNotebook": $(jq '.defaultNotebook' <<<"$c"),
 
@@ -764,7 +764,7 @@ $notebooks
   "editor": $(jq '.editor' <<<"$c")
 }
 
-// Note types (type / in Jot) are not set here. They are the zk groups
+// Note types (type / in Zettel) are not set here. They are the zk groups
 // and templates of each notebook: NOTEBOOK/.zk/config.toml and
 // NOTEBOOK/.zk/templates/. Every [group.NAME] except journal is a type.
 EOF
@@ -772,7 +772,7 @@ EOF
 
 cmd_config() {
   local sub=${positional[0]:-path}
-  [[ $sub == path ]] || die "usage: jot config [path]"
+  [[ $sub == path ]] || die "usage: zettel config [path]"
   [[ -f $CONFIG_FILE ]] || write_config "$(read_config)"
   jq -cn --arg path "$CONFIG_FILE" '{path: $path}'
 }
@@ -791,7 +791,7 @@ cmd_notebook() {
     return
     ;;
   add)
-    ((${#positional[@]} == 3)) || die "usage: jot notebook add NAME PATH"
+    ((${#positional[@]} == 3)) || die "usage: zettel notebook add NAME PATH"
     name=${positional[1]}
     path=$(expand_path "${positional[2]}")
     [[ $path == /* ]] || path=$PWD/$path
@@ -805,7 +805,7 @@ cmd_notebook() {
     config=$(jq -c --arg n "$name" --arg p "$path" '.notebooks += [{name: $n, path: $p}]' <<<"$config")
     ;;
   remove)
-    ((${#positional[@]} == 2)) || die "usage: jot notebook remove NAME"
+    ((${#positional[@]} == 2)) || die "usage: zettel notebook remove NAME"
     name=${positional[1]}
     jq -e --arg n "$name" 'any(.[]; .name == $n)' <<<"$current" >/dev/null || die "no notebook named $name"
     config=$(jq -c --arg n "$name" '.notebooks |= map(select(.name != $n))
@@ -813,12 +813,12 @@ cmd_notebook() {
     [[ $(jq '.notebooks | length' <<<"$config") -gt 0 ]] || die "cannot remove the last notebook"
     ;;
   default)
-    ((${#positional[@]} == 2)) || die "usage: jot notebook default NAME"
+    ((${#positional[@]} == 2)) || die "usage: zettel notebook default NAME"
     name=${positional[1]}
     jq -e --arg n "$name" 'any(.[]; .name == $n)' <<<"$current" >/dev/null || die "no notebook named $name"
     config=$(jq -c --arg n "$name" '.defaultNotebook = $n' <<<"$config")
     ;;
-  *) die "usage: jot notebook list|add NAME PATH|remove NAME|default NAME" ;;
+  *) die "usage: zettel notebook list|add NAME PATH|remove NAME|default NAME" ;;
   esac
 
   write_config "$config"
@@ -827,17 +827,17 @@ cmd_notebook() {
 
 # --- setup -----------------------------------------------------------------
 
-STATE_DIR=${JOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/jot}
-BINDINGS_FILE=${JOT_BINDINGS:-$HOME/.config/hypr/bindings.lua}
-BIN_LINK=${JOT_BIN_LINK:-$HOME/.local/bin/jot}
-PLUGIN_ID=lipchanskiy.jot
+STATE_DIR=${ZETTEL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/zettel}
+BINDINGS_FILE=${ZETTEL_BINDINGS:-$HOME/.config/hypr/bindings.lua}
+BIN_LINK=${ZETTEL_BIN_LINK:-$HOME/.local/bin/zettel}
+PLUGIN_ID=lipchanskiy.zettel
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
-# Shortcuts Jot may take, best first: "label|hyprland modmask|key".
+# Shortcuts Zettel may take, best first: "label|hyprland modmask|key".
 # Modmask bits: Shift 1, Ctrl 4, Alt 8, Super 64.
 SHORTCUTS=("SUPER + N|64|N" "SUPER + ALT + N|72|N" "SUPER + SHIFT + ALT + N|73|N")
 
-# The shortcut already bound to Jot in bindings.lua, if any.
+# The shortcut already bound to Zettel in bindings.lua, if any.
 bound_shortcut() {
   [[ -f $BINDINGS_FILE ]] || return 0
   grep -F "\"$PLUGIN_ID\"" "$BINDINGS_FILE" | grep -vE '^[[:space:]]*--' | grep -E 'panel[[:space:]]*=' \
@@ -851,23 +851,36 @@ shortcut_free() {
     'any(.[]; .modmask == $m and (.key | ascii_upcase) == $k)' >/dev/null
 }
 
+# The first free shortcut Zettel would offer, or nothing.
+free_shortcut() {
+  local entry label modmask key
+  [[ -f $BINDINGS_FILE ]] || return 0
+  for entry in "${SHORTCUTS[@]}"; do
+    IFS='|' read -r label modmask key <<<"$entry"
+    if shortcut_free "$modmask" "$key"; then printf '%s' "$label"; return; fi
+  done
+}
+
 # Sets up what a plugin install cannot: a shortcut in the user's Hyprland
-# bindings, the `jot` command on PATH, and the commented settings file.
-# Safe to run again; --first-run does nothing after the first time.
+# bindings, the `zettel` command on PATH, and the commented settings file.
+# Nothing touches the user's bindings until they agree: the window asks on
+# its first load (--check tells it whether to ask), then runs `zettel setup`
+# or `zettel setup --no-shortcut`. Safe to run again.
 # --remove undoes the shortcut and the command (settings and notes stay).
 cmd_setup() {
-  local first_run=false remove=false arg
+  local check=false remove=false no_shortcut=false arg
   for arg in "${positional[@]}"; do
     case $arg in
-    --first-run) first_run=true ;;
+    --check) check=true ;;
+    --no-shortcut) no_shortcut=true ;;
     --remove) remove=true ;;
-    *) die "usage: jot setup [--first-run] [--remove]" ;;
+    *) die "usage: zettel setup [--check|--no-shortcut|--remove]" ;;
     esac
   done
 
   if $remove; then
     if [[ -f $BINDINGS_FILE ]] && grep -q "$PLUGIN_ID" "$BINDINGS_FILE"; then
-      # Drop Jot's lines and the blank line setup put before them.
+      # Drop Zettel's lines and the blank line setup put before them.
       local kept
       kept=$(awk -v id="$PLUGIN_ID" '
         index($0, id) { if (held) held = 0; next }
@@ -883,28 +896,35 @@ cmd_setup() {
     return
   fi
 
-  if $first_run && [[ -f $STATE_DIR/setup.json ]]; then
-    jq -c '. + {firstRun: false}' "$STATE_DIR/setup.json" 2>/dev/null || jq -cn '{firstRun: false}'
+  # Read only: has setup run, and what would it bind?
+  if $check; then
+    local bindings_found=false bound
+    [[ -f $BINDINGS_FILE ]] && bindings_found=true
+    bound=$(bound_shortcut)
+    if [[ -f $STATE_DIR/setup.json ]]; then
+      jq -c '. + {asked: true}' "$STATE_DIR/setup.json" 2>/dev/null || jq -cn '{asked: true}'
+    else
+      jq -cn --arg bound "$bound" --arg offer "$( [[ -z $bound ]] && free_shortcut)" --argjson bf $bindings_found \
+        --arg bindings "$BINDINGS_FILE" \
+        '{asked: false, bound: $bound, offer: $offer, bindingsFound: $bf, bindings: $bindings}'
+    fi
     return
   fi
 
   # Shortcut.
   local shortcut added=false entry label modmask key
   shortcut=$(bound_shortcut)
-  if [[ -z $shortcut && -f $BINDINGS_FILE ]]; then
-    for entry in "${SHORTCUTS[@]}"; do
-      IFS='|' read -r label modmask key <<<"$entry"
-      if shortcut_free "$modmask" "$key"; then
-        printf '\n-- Jot: find and capture notes (%s). Remove with: jot setup --remove\no.bind("%s", "Notes", { panel = "%s" })\n' \
-          "$PLUGIN_ID" "$label" "$PLUGIN_ID" >>"$BINDINGS_FILE" || die "cannot update $BINDINGS_FILE"
-        shortcut=$label
-        added=true
-        break
-      fi
-    done
+  if [[ -z $shortcut ]] && ! $no_shortcut; then
+    label=$(free_shortcut)
+    if [[ -n $label ]]; then
+      printf '\n-- Zettel: find and capture notes (%s). Remove with: zettel setup --remove\no.bind("%s", "Notes", { panel = "%s" })\n' \
+        "$PLUGIN_ID" "$label" "$PLUGIN_ID" >>"$BINDINGS_FILE" || die "cannot update $BINDINGS_FILE"
+      shortcut=$label
+      added=true
+    fi
   fi
 
-  # `jot` command. An existing file that is not ours is left alone.
+  # `zettel` command. An existing file that is not ours is left alone.
   local linked=false
   if [[ -L $BIN_LINK && $(readlink -f "$BIN_LINK") == "$SELF" ]]; then
     linked=true
@@ -922,7 +942,7 @@ cmd_setup() {
     --arg bindings "$BINDINGS_FILE" --arg config "$CONFIG_FILE" \
     '{shortcut: $s, shortcutAdded: $added, commandLinked: $linked, bindingsFound: $bf, bindings: $bindings, config: $config}')
   mkdir -p "$STATE_DIR" && printf '%s\n' "$result" >"$STATE_DIR/setup.json"
-  jq -c --argjson first $first_run '. + {firstRun: $first}' <<<"$result"
+  printf '%s\n' "$result"
 }
 
 case $cmd in
@@ -935,5 +955,5 @@ init) cmd_init ;;
 notebook) cmd_notebook ;;
 config) cmd_config ;;
 setup) cmd_setup ;;
-*) die "usage: jot status|search|types|new|daily|init|notebook|config|setup" ;;
+*) die "usage: zettel status|search|types|new|daily|init|notebook|config|setup" ;;
 esac

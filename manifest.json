@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "lipchanskiy.jot",
-  "name": "Jot",
+  "id": "lipchanskiy.zettel",
+  "name": "Zettel",
   "version": "0.1.0",
   "author": "lipchanskiy",
   "description": "Find and capture notes from anywhere, backed by zk",
   "kinds": ["overlay"],
   "keepLoaded": true,
-  "entryPoints": { "overlay": "Jot.qml" }
+  "entryPoints": { "overlay": "Zettel.qml" }
 }

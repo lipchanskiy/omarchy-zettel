@@ -5,9 +5,9 @@ import QtQuick
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
-import "Jot.js" as Jot
+import "Zettel.js" as Zettel
 
-// Jot: one window to find and capture notes, backed by zk.
+// Zettel: one window to find and capture notes, backed by zk.
 // Typing searches every notebook; Enter opens the selected note in the
 // user's default editor, Ctrl+Enter saves what was typed as a new note,
 // Alt+Enter appends it to today's journal.
@@ -19,13 +19,13 @@ Item {
   property var manifest: null
 
   readonly property string home: Quickshell.env("HOME")
-  readonly property string script: decodeURIComponent(String(Qt.resolvedUrl("bin/jot")).replace(/^file:\/\//, ""))
-  readonly property string configPath: (Quickshell.env("XDG_CONFIG_HOME") || (root.home + "/.config")) + "/jot/config.jsonc"
+  readonly property string script: decodeURIComponent(String(Qt.resolvedUrl("bin/zettel")).replace(/^file:\/\//, ""))
+  readonly property string configPath: (Quickshell.env("XDG_CONFIG_HOME") || (root.home + "/.config")) + "/zettel/config.jsonc"
 
   property bool opened: false
   // checking | noZk | ready
   property string phase: "checking"
-  property var settings: Jot.parseConfig("", root.home)
+  property var settings: Zettel.parseConfig("", root.home)
   readonly property var notebooks: settings.notebooks
   readonly property bool multiNotebook: notebooks.length > 1
   property int captureIndex: 0
@@ -62,7 +62,7 @@ Item {
   readonly property var noteTypes: [{ id: "journal", label: root.typeLabel("journal"), builtin: true,
                                       dir: root.settings.journalFolder, template: "", templatePath: "" }].concat(root.userTypes)
   property int suggestionIndex: 0
-  readonly property var prefix: Jot.parseTypePrefix(root.query, root.noteTypes)
+  readonly property var prefix: Zettel.parseTypePrefix(root.query, root.noteTypes)
   // The "/" list: matching types, plus "create type" for a new valid name.
   // A "/word" that matches nothing and can't be a type name is plain text.
   readonly property var typeCandidates: {
@@ -74,7 +74,7 @@ Item {
       var t = root.noteTypes[i]
       if (t.id.toLowerCase() === word.toLowerCase() || t.label.toLowerCase() === word.toLowerCase()) exists = true
     }
-    if (word && !exists && Jot.validTypeName(word)) list.push({ id: word, label: word, create: true, dir: "", template: "", templatePath: "" })
+    if (word && !exists && Zettel.validTypeName(word)) list.push({ id: word, label: word, create: true, dir: "", template: "", templatePath: "" })
     return list
   }
   readonly property bool suggesting: phase === "ready" && prefix.mode === "suggest"
@@ -145,7 +145,7 @@ Item {
   }
 
   function focusForPhase() {
-    if (root.phase === "noZk") setupKeys.forceActiveFocus()
+    if (root.welcome || root.phase === "noZk") setupKeys.forceActiveFocus()
     else { input.forceActiveFocus(); input.cursorPosition = input.text.length }
   }
 
@@ -164,7 +164,7 @@ Item {
   function checkStatus() {
     if (statusProc.running) { statusProc.pending = true; return }
     statusProc.pending = false
-    statusProc.command = [root.script, "status"].concat(Jot.notebookArgs(root.notebooks))
+    statusProc.command = [root.script, "status"].concat(Zettel.notebookArgs(root.notebooks))
     statusProc.running = true
   }
 
@@ -172,7 +172,7 @@ Item {
     // Notebooks changed while this check ran; its answer is stale, and
     // statusProc.onExited runs the check again.
     if (statusProc.pending) return
-    var status = Jot.parseJson(text)
+    var status = Zettel.parseJson(text)
     if (!status || status.error || !status.zk) {
       root.missingTool = status && status.error && /jq/.test(String(status.error)) ? "jq" : "zk"
       root.phase = "noZk"
@@ -201,7 +201,7 @@ Item {
       // A configured notebook folder that does not exist yet (or is empty) is
       // created on the spot, once per session, so the first open just works.
       // An existing folder with files becomes a notebook only when asked
-      // (jot notebook add), and the home folder never does.
+      // (zettel notebook add), and the home folder never does.
       if (!root.initTried[nb.path] && (!nb.exists || nb.empty) && !nb.isHome)
         toCreate.push({ name: nb.name, path: nb.path })
     }
@@ -242,7 +242,7 @@ Item {
     root.searchedQuery = root.searchText
     root.requestedSearch = root.searchText
     searchProc.command = [root.script, "search", "--limit", "60"]
-      .concat(Jot.notebookArgs(root.notebooks)).concat(["--", root.searchText])
+      .concat(Zettel.notebookArgs(root.notebooks)).concat(["--", root.searchText])
     searchProc.running = true
   }
 
@@ -253,7 +253,7 @@ Item {
 
   function applySearch(text) {
     root.searching = false
-    var result = Jot.parseJson(text)
+    var result = Zettel.parseJson(text)
     var notes = result && Array.isArray(result.notes) ? result.notes : []
     var previousPath = root.cursorActive && root.selectedIndex < resultModel.count
       ? resultModel.get(root.selectedIndex).absPath : ""
@@ -263,7 +263,7 @@ Item {
       var n = notes[i]
       if (!n || typeof n.absPath !== "string") continue
       resultModel.append({
-        title: Jot.displayTitle(n).slice(0, 300),
+        title: Zettel.displayTitle(n).slice(0, 300),
         absPath: n.absPath,
         notebook: String(n.notebook || ""),
         relPath: String(n.path || ""),
@@ -330,12 +330,12 @@ Item {
 
   function cycleNotebook(delta) {
     if (!root.multiNotebook) return
-    root.captureIndex = Jot.cycle(root.captureIndex, delta, root.notebooks.length)
+    root.captureIndex = Zettel.cycle(root.captureIndex, delta, root.notebooks.length)
   }
 
   // ------------------------------------------------------------ note types
 
-  // A type's name in the shell's language: Jot's own types are translated,
+  // A type's name in the shell's language: Zettel's own types are translated,
   // the user's own zk groups and templates keep their names.
   function typeLabel(id) {
     var key = "type." + id
@@ -352,7 +352,7 @@ Item {
   }
 
   function applyTypes(text) {
-    var list = Jot.parseJson(text)
+    var list = Zettel.parseJson(text)
     var types = []
     if (Array.isArray(list)) {
       for (var i = 0; i < list.length && types.length < 50; i++) {
@@ -395,7 +395,7 @@ Item {
   }
 
   function finishCreateType(text) {
-    var result = Jot.parseJson(text)
+    var result = Zettel.parseJson(text)
     if (!result || result.error || !result.id) {
       root.notify(strings.t("error.type"), result && result.error ? String(result.error) : typeAddProc.name)
       return
@@ -466,7 +466,7 @@ Item {
   }
 
   function finishAction(text) {
-    var result = Jot.parseJson(text)
+    var result = Zettel.parseJson(text)
     if (!result || result.error || !result.path) {
       // Keep what was typed: the next open puts it back.
       root.unsavedText = (root.activeTypePrefixFor(actionProc) + actionProc.text)
@@ -485,7 +485,7 @@ Item {
     root.query = ""
   }
 
-  // The editor from Jot's settings, or Omarchy's default editor. A terminal
+  // The editor from Zettel's settings, or Omarchy's default editor. A terminal
   // editor gets a terminal window, the way omarchy-launch-editor does it.
   function openInEditor(path) {
     var paths = Array.isArray(path) ? path : [path]
@@ -548,7 +548,7 @@ Item {
   }
 
   function finishInit(text) {
-    var result = Jot.parseJson(text)
+    var result = Zettel.parseJson(text)
     if (result && result.created) root.createdNotebooks = root.createdNotebooks.concat([initProc.target])
     else if (!result || result.error)
       root.notify(strings.t("error.notebook"), result && result.error ? String(result.error) : initProc.target)
@@ -558,7 +558,7 @@ Item {
   function installZk() {
     root.close()
     Quickshell.execDetached(["xdg-terminal-exec", "bash", "-c",
-      "omarchy-pkg-add zk jq && echo && echo 'Done. Open Jot again to start.' || echo 'Installing failed.'; read -rsn1 -p 'Press any key to close'"])
+      "omarchy-pkg-add zk jq && echo && echo 'Done. Open Zettel again to start.' || echo 'Installing failed.'; read -rsn1 -p 'Press any key to close'"])
   }
 
   function plainEnter() {
@@ -581,6 +581,12 @@ Item {
     var enter = event.key === Qt.Key_Return || event.key === Qt.Key_Enter
 
     if (!(event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) root.enterPending = false
+
+    if (root.welcome) {
+      if (enter) root.runSetup(!!root.setupOffer.offer)
+      else if (event.key === Qt.Key_Escape) root.runSetup(false)
+      return true
+    }
 
     if (event.key === Qt.Key_Escape) {
       if (input.text) input.text = ""
@@ -640,28 +646,66 @@ Item {
 
   // ------------------------------------------------------------ first run
 
-  // Loaded with the shell, so this runs right after the plugin is installed:
-  // `jot setup --first-run` binds a shortcut, links the `jot` command and
-  // writes the settings file, once. Later loads only read its saved result.
-  Component.onCompleted: setupProc.running = true
+  // Loaded with the shell, so this runs right after the plugin is enabled.
+  // `zettel setup --check` changes nothing; if Zettel has never asked, the window
+  // opens once with a welcome screen that asks before the shortcut is added
+  // to the user's Hyprland bindings.
+  property bool welcome: false
+  property var setupOffer: ({})
+
+  Component.onCompleted: setupCheckProc.running = true
+
+  function prettyKeys(shortcut) {
+    return String(shortcut).split("+").map(function(k) {
+      k = k.trim().toLowerCase()
+      return k.charAt(0).toUpperCase() + k.slice(1)
+    }).join("+")
+  }
+
+  function finishSetupCheck(text) {
+    var result = Zettel.parseJson(text)
+    if (!result || result.asked !== false) return
+    root.setupOffer = result
+    // Bound by hand already: nothing to ask, just finish quietly.
+    if (result.bound) { root.runSetup(true); return }
+    root.welcome = true
+    root.open("{}")
+  }
+
+  // agreed: add the offered shortcut. Either way the answer is remembered.
+  function runSetup(agreed) {
+    if (setupProc.running) return
+    setupProc.agreed = agreed
+    setupProc.command = [root.script, "setup"].concat(agreed ? [] : ["--no-shortcut"])
+    setupProc.running = true
+  }
 
   function finishSetup(text) {
-    var result = Jot.parseJson(text)
-    if (!result || !result.firstRun) return
-    if (result.shortcut) {
-      var keys = String(result.shortcut).split("+").map(function(k) {
-        k = k.trim().toLowerCase()
-        return k.charAt(0).toUpperCase() + k.slice(1)
-      }).join("+")
-      root.notify(strings.t("setup.ready"), strings.t("setup.readyBody").arg(keys))
+    var result = Zettel.parseJson(text) || {}
+    var wasWelcome = root.welcome
+    root.welcome = false
+    if (!wasWelcome) return
+    if (setupProc.agreed && result.shortcut) {
+      root.notify(strings.t("setup.ready"), strings.t("setup.readyBody").arg(root.prettyKeys(result.shortcut)))
+      Qt.callLater(root.focusForPhase)
     } else {
-      root.notify(strings.t("setup.ready"), strings.t(result.bindingsFound === false ? "setup.noBindings" : "setup.noShortcut"))
+      root.close()
+      root.notify(strings.t("setup.ready"), strings.t("setup.later"))
+    }
+  }
+
+  Process {
+    id: setupCheckProc
+    command: [root.script, "setup", "--check"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.finishSetupCheck(text)
     }
   }
 
   Process {
     id: setupProc
-    command: [root.script, "setup", "--first-run"]
+    property bool agreed: false
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.finishSetup(text)
@@ -694,7 +738,7 @@ Item {
   function applyConfig(text) {
     if (text === root.lastConfigText) return
     root.lastConfigText = text
-    root.settings = Jot.parseConfig(text, root.home)
+    root.settings = Zettel.parseConfig(text, root.home)
   }
 
   onNotebooksChanged: {
@@ -767,7 +811,7 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var result = Jot.parseJson(text)
+        var result = Zettel.parseJson(text)
         if (result && result.path) root.openInEditor(result.path)
         else root.notify(strings.t("error.settings"), result && result.error ? String(result.error) : "")
       }
@@ -800,7 +844,7 @@ Item {
   OverlayWindow {
     id: panel
     shown: root.opened
-    WlrLayershell.namespace: "omarchy-jot"
+    WlrLayershell.namespace: "omarchy-zettel"
 
     Rectangle { anchors.fill: parent; color: root.scrim }
 
@@ -825,6 +869,94 @@ Item {
       Item {
         id: setupKeys
         Keys.onPressed: function(event) { if (root.handleKey(event)) event.accepted = true }
+      }
+
+      // ---- welcome: asks once before touching the user's bindings
+      Rectangle {
+        anchors.fill: parent
+        anchors.topMargin: card.contentTopInset
+        anchors.rightMargin: card.contentRightInset
+        anchors.bottomMargin: card.contentBottomInset
+        anchors.leftMargin: card.contentLeftInset
+        z: 10
+        visible: root.welcome
+        color: root.background
+        radius: root.cornerRadius
+
+        MouseArea { anchors.fill: parent; onClicked: setupKeys.forceActiveFocus() }
+
+        Column {
+          anchors.centerIn: parent
+          width: Math.min(parent.width - 4 * root.contentMargin, Style.space(620))
+          spacing: Style.space(14)
+
+          Text {
+            text: "󰎞"
+            color: root.selectedText
+            opacity: 0.8
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.displayLarge
+            anchors.horizontalCenter: parent.horizontalCenter
+          }
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.Wrap
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+            text: strings.t("welcome.title")
+          }
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.Wrap
+            color: root.foreground
+            opacity: 0.7
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            text: strings.t("welcome.body")
+          }
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.Wrap
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            text: root.setupOffer.offer
+              ? strings.t("welcome.ask").arg(root.prettyKeys(root.setupOffer.offer)).arg(String(root.setupOffer.bindings || "").replace(root.home, "~"))
+              : strings.t(root.setupOffer.bindingsFound === false ? "setup.noBindings" : "setup.noShortcut")
+          }
+          Row {
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: Style.space(12)
+            Button {
+              visible: !!root.setupOffer.offer
+              bordered: true
+              text: strings.t("welcome.yes").arg(root.prettyKeys(root.setupOffer.offer || ""))
+              onClicked: root.runSetup(true)
+            }
+            Button {
+              text: strings.t(root.setupOffer.offer ? "welcome.no" : "welcome.ok")
+              onClicked: root.runSetup(false)
+            }
+          }
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            color: root.foreground
+            opacity: 0.5
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            text: root.setupOffer.offer ? strings.t("welcome.hint") : ""
+          }
+        }
       }
 
       Column {
@@ -1102,7 +1234,7 @@ Item {
                         var parts = []
                         if (row.conflict) parts.push(strings.t(row.conflict.role === "copy" ? "conflict.copyTag" : "conflict.originalTag"))
                         if (root.multiNotebook) parts.push(row.notebook)
-                        var when = Jot.relativeDate(row.modified, Qt.locale(Commons.I18n.formatLocale),
+                        var when = Zettel.relativeDate(row.modified, Qt.locale(Commons.I18n.formatLocale),
                                                     strings.t("date.today"), strings.t("date.yesterday"))
                         if (when) parts.push(when)
                         if (row.tags) parts.push(row.tags)
@@ -1158,7 +1290,7 @@ Item {
                   function onPreviewPathChanged() { previewFlick.contentY = 0 }
                 }
 
-                // Markdown from disk, made inert by Jot.sanitizeMarkdown: no raw
+                // Markdown from disk, made inert by Zettel.sanitizeMarkdown: no raw
                 // HTML, no images, no remote resources. Links are not followed.
                 Column {
                   id: previewColumn
@@ -1183,7 +1315,7 @@ Item {
                   id: previewText
                   width: parent.width
                   textFormat: Text.MarkdownText
-                  text: Jot.sanitizeMarkdown(root.previewContent)
+                  text: Zettel.sanitizeMarkdown(root.previewContent)
                   color: root.foreground
                   linkColor: Commons.Color.accent
                   font.family: Style.font.family
