@@ -58,5 +58,19 @@
   "welcome.no": "Not now",
   "welcome.ok": "OK",
   "welcome.hint": "Enter add shortcut  ·  Esc not now",
-  "setup.later": "No shortcut was added. Run zettel setup in a terminal whenever you want one."
+  "setup.later": "No shortcut was added. Run zettel setup in a terminal whenever you want one.",
+  "trust.title": "The settings of %1 have changed",
+  "trust.body": "A notebook's settings and templates can run commands on your computer, so Zettel won't use this notebook until you trust it. If you made these changes, trust it. If the notebook came through sync, git or from someone else and you didn't expect changes, look at them first.",
+  "trust.yes": "Trust",
+  "trust.no": "Not now",
+  "trust.hint": "Enter open settings  ·  Ctrl+Enter trust  ·  Esc not now  ·  ↑↓ scroll",
+  "trust.titleNew": "You haven't trusted %1 yet",
+  "trust.noDiff": "Something changed, but there is nothing to show line by line, such as an empty file being added.",
+  "trust.open": "Open settings",
+  "trust.blocked": "%1 is turned off",
+  "trust.blockedBody": "You haven't trusted its settings yet. Nothing was saved, and your text is still in the window. Open Zettel again to look at the settings, or run: zettel trust %1",
+  "hint.distrusted": "Off until you trust them: %1",
+  "trust.hidden.outside": "Link to a file outside the notebook: %1 · contents not shown · fingerprint %2",
+  "trust.hidden.large": "File over 256 KB · contents not shown · fingerprint %1",
+  "trust.hidden.binary": "Binary file · contents not shown · fingerprint %1"
 }

@@ -87,6 +87,7 @@ check "zk still reads the config" "$(zk list --notebook-dir "$NB" -q -P --format
 typed=$(zettel new --nb N "$NB" --type рецепт -- $'Борщ\nсвёкла' | jq -r .path)
 check "typed notes go to their folder" "$(basename "$(dirname "$typed")")" "рецепт"
 printf '# 💡 {{title}}\n' >"$NB/.zk/templates/idea.md"
+zettel trust "$NB" >/dev/null   # the user edited their own template
 idea=$(zettel new --nb N "$NB" --type idea -- $'Идея\nтекст' | jq -r .path)
 check "text survives a template without {{content}}" "$(grep -c '^текст$' "$idea")" "1"
 check "unknown types are refused" "$(zettel new --nb N "$NB" --type nope -- x | jq -r .error)" "unknown note type: nope"
@@ -120,6 +121,7 @@ check "and keeps its permissions" "$(stat -c %a "$TMP/dotfiles/config.jsonc")" "
 
 # --- type names from hand-written configs
 printf '\n[group."my notes"]\npaths = ["my notes"]\n' >>"$NB/.zk/config.toml"
+zettel trust "$NB" >/dev/null   # the user edited their own config
 check "group names keep their spaces" "$(zettel types --nb N "$NB" | jq -r '[.[].id] | index("my notes") != null')" "true"
 check "type names cannot look like options" "$(zettel types add -- --nb --nb N "$NB" | jq -r 'has("error")')" "true"
 
@@ -142,6 +144,7 @@ if command -v git >/dev/null 2>&1; then
   zettel init "$G/a" >/dev/null
   git -C "$G/a" init -q && git -C "$G/a" add -A && git -C "$G/a" -c user.name=t -c user.email=t@t commit -qm init
   git clone -q "$G/a" "$G/b"
+  zettel trust "$G/b" >/dev/null   # the user trusts their own clone
   zettel daily --nb A "$G/a" -- 'from machine a' >/dev/null
   zettel daily --nb B "$G/b" -- 'from machine b' >/dev/null
   git -C "$G/a" add -A && git -C "$G/a" -c user.name=t -c user.email=t@t commit -qm a
@@ -171,6 +174,64 @@ zettel init "$TMP/older2" >/dev/null
 check "an existing [alias] table is left alone" "$(grep -c '^\[alias\]' "$TMP/older2/.zk/config.toml")" "1"
 check "a journal template the user changed is left alone" \
   "$(printf '# My day\n' >"$TMP/older/.zk/templates/journal.md"; zettel init "$TMP/older" >/dev/null; cat "$TMP/older/.zk/templates/journal.md")" "# My day"
+
+# --- trust: a notebook's zk config is code (aliases, {{sh}} in templates)
+EVIL=$TMP/evil
+zettel init "$EVIL" >/dev/null
+check "a notebook Zettel creates is trusted" "$(zettel status --nb E "$EVIL" | jq -r '.notebooks[0].trusted')" "true"
+zettel new --nb E "$EVIL" -- 'harmless' >/dev/null
+sed -i "s|^\[alias\]$|[alias]\nlist = 'touch $TMP/PWNED-list'\nnew = 'touch $TMP/PWNED-new'|" "$EVIL/.zk/config.toml"
+check "a changed config is no longer trusted" "$(zettel status --nb E "$EVIL" | jq -r '.notebooks[0].trusted')" "false"
+res=$(zettel search --nb E "$EVIL" --nb N "$NB" -- '')
+check "search skips the untrusted notebook" "$(jq -c .untrusted <<<"$res")" '["E"]'
+check "and still searches the trusted one" "$(jq '[.notes[] | select(.notebook == "N")] | length > 0' <<<"$res")" "true"
+check "new refuses an untrusted notebook" "$(zettel new --nb E "$EVIL" -- 'x' | jq -r .error)" "untrusted notebook: $EVIL"
+check "no alias ran" "$(ls "$TMP" | grep -c PWNED)" "0"
+printf '{{sh "touch %s/PWNED-sh"}}\n' "$TMP" >"$TMP/evil2.md"
+cp "$TMP/evil2.md" "$EVIL/.zk/templates/default.md"
+sed -i '/PWNED/d' "$EVIL/.zk/config.toml"
+check "a changed template is not trusted either" "$(zettel status --nb E "$EVIL" | jq -r '.notebooks[0].trusted')" "false"
+zettel new --nb E "$EVIL" -- 'x' >/dev/null
+check "and its {{sh}} did not run" "$(ls "$TMP" | grep -c PWNED)" "0"
+ln -s "$TMP/evil2.md" "$EVIL/.zk/templates/linked.md"
+zettel trust "$EVIL" >/dev/null
+check "trust accepts the notebook as it is" "$(zettel status --nb E "$EVIL" | jq -r '.notebooks[0].trusted')" "true"
+echo changed >>"$TMP/evil2.md"
+check "a file linked into .zk counts too" "$(zettel status --nb E "$EVIL" | jq -r '.notebooks[0].trusted')" "false"
+zettel trust "$EVIL" >/dev/null
+zettel types add idea --nb E "$EVIL" >/dev/null
+check "adding a type keeps it trusted" "$(zettel status --nb E "$EVIL" | jq -r '.notebooks[0].trusted')" "true"
+mkdir -p "$TMP/foreign/.zk"; : >"$TMP/foreign/.zk/config.toml"
+zettel init "$TMP/foreign" >/dev/null
+check "init on someone else's notebook does not trust it" "$(zettel status --nb F "$TMP/foreign" | jq -r '.notebooks[0].trusted')" "false"
+cp -r "$NB" "$TMP/copy"
+check "trust is per folder, a copy is not trusted" "$(zettel status --nb C "$TMP/copy" | jq -r '.notebooks[0].trusted')" "false"
+check "the journal refuses an untrusted notebook" "$(zettel daily --nb F "$TMP/foreign" -- x | jq -r .error)" "untrusted notebook: $TMP/foreign"
+zettel trust "$EVIL" >/dev/null
+printf 'list = "echo hi"\n' >>"$EVIL/.zk/config.toml"
+check "diff shows the added line" "$(zettel trust --diff "$EVIL" | jq -r .diff | grep -c "^+list = .echo hi.")" "1"
+check "diff names the file inside .zk" "$(zettel trust --diff "$EVIL" | jq -r .diff | grep -c '^+++ b/config.toml')" "1"
+check "a notebook never trusted has no earlier copy" "$(zettel trust --diff "$TMP/foreign" | jq -r .known)" "false"
+zettel trust "$EVIL" >/dev/null
+check "trusting clears the diff" "$(zettel trust --diff "$EVIL" | jq -r .diff)" ""
+printf 'TOPSECRET\n' >"$TMP/secret.key"
+ln -s "$TMP/secret.key" "$EVIL/.zk/templates/key.md"
+head -c 300000 /dev/zero | tr '\0' a >"$EVIL/.zk/big.txt"
+printf 'a\0b' >"$EVIL/.zk/blob.dat"
+diff_out=$(zettel trust --diff "$EVIL" | jq -r .diff)
+check "a link leading outside .zk is named, not shown" "$(grep -c "^+zettel:hidden.outside.*$TMP/secret.key" <<<"$diff_out"; grep -c TOPSECRET <<<"$diff_out")" $'1\n0'
+check "a big file is not shown" "$(grep -c '^+zettel:hidden.large' <<<"$diff_out")" "1"
+check "a binary file is not shown" "$(grep -c '^+zettel:hidden.binary' <<<"$diff_out")" "1"
+zettel trust "$EVIL" >/dev/null
+check "the trusted copy holds nothing from outside .zk" "$(grep -rlc TOPSECRET "$ZETTEL_STATE_DIR" | wc -l)" "0"
+check "the trusted copy is private" "$(stat -c %a "$ZETTEL_STATE_DIR/trusted" "$ZETTEL_STATE_DIR"/trusted/*/config.toml | sort -u)" $'600\n700'
+printf 'OTHER\n' >"$TMP/secret.key"
+diff_out=$(zettel trust --diff "$EVIL" | jq -r .diff)
+check "a change behind such a link still shows" "$(grep -c '^[-+]zettel:hidden.outside' <<<"$diff_out"; grep -c 'OTHER' <<<"$diff_out")" $'2\n0'
+rm -f "$EVIL/.zk/templates/key.md" "$EVIL/.zk/big.txt" "$EVIL/.zk/blob.dat"
+zettel trust --forget "$EVIL" >/dev/null
+check "forget takes trust back" "$(zettel status --nb E "$EVIL" | jq -r '.notebooks[0].trusted')" "false"
+rm -f "$TMP"/PWNED*
 
 # --- setup
 printf -- '-- mine\no.bind("SUPER + X", "x", "x")\n' >"$ZETTEL_BINDINGS"

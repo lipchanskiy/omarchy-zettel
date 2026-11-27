@@ -23,7 +23,7 @@ Item {
   readonly property string configPath: (Quickshell.env("XDG_CONFIG_HOME") || (root.home + "/.config")) + "/zettel/config.jsonc"
 
   property bool opened: false
-  // checking | noZk | ready
+  // checking | noZk | untrusted | ready
   property string phase: "checking"
   property var settings: Zettel.parseConfig("", root.home)
   readonly property var notebooks: settings.notebooks
@@ -33,6 +33,17 @@ Item {
   property var missingNotebooks: []
   // Files sync tools left when two machines changed the same note.
   property var conflicts: []
+  // Notebooks whose zk configuration changed since the user last trusted it.
+  // zk runs commands from that configuration, so Zettel asks first, one
+  // notebook at a time, showing what changed.
+  property var untrustedNotebooks: []
+  readonly property var trustAsking: untrustedNotebooks.length > 0 ? untrustedNotebooks[0] : null
+  // { path, known, lines: [{ text, kind }] } for trustAsking.
+  property var trustDiff: null
+  // Skipped this session with Esc: left alone, asked again next session.
+  property var trustSkipped: ({})
+  // Names of notebooks that are off because they are not trusted.
+  property var distrusted: []
   // Which conflict a note is part of: as the copy or as the original.
   function conflictOf(path) {
     for (var i = 0; i < root.conflicts.length; i++) {
@@ -145,7 +156,7 @@ Item {
   }
 
   function focusForPhase() {
-    if (root.welcome || root.phase === "noZk") setupKeys.forceActiveFocus()
+    if (root.welcome || root.phase === "noZk" || root.phase === "untrusted") setupKeys.forceActiveFocus()
     else { input.forceActiveFocus(); input.cursorPosition = input.text.length }
   }
 
@@ -211,6 +222,22 @@ Item {
       return
     }
     root.missingNotebooks = missing
+    var untrusted = []
+    for (var u = 0; u < status.notebooks.length; u++) {
+      var tnb = status.notebooks[u]
+      if (tnb.notebook && tnb.trusted === false && !root.trustSkipped[tnb.path])
+        untrusted.push({ name: tnb.name, path: tnb.path })
+    }
+    var off = []
+    for (var o = 0; o < status.notebooks.length; o++)
+      if (status.notebooks[o].notebook && status.notebooks[o].trusted === false) off.push(status.notebooks[o].name)
+    root.distrusted = off
+    root.untrustedNotebooks = untrusted
+    if (untrusted.length > 0) {
+      root.phase = "untrusted"
+      root.fetchTrustDiff()
+      return
+    }
     root.phase = "ready"
     if (root.phase === "ready") {
       root.requestedSearch = "\u0000"
@@ -449,6 +476,10 @@ Item {
     var text = (root.activeType ? root.prefix.rest : input.text).replace(/\s+$/, "")
     if (!text.trim() && !type) return
     var nb = root.captureNotebook
+    if (root.distrusted.indexOf(nb.name) >= 0) {
+      root.notify(strings.t("trust.blocked").arg(nb.name), strings.t("trust.blockedBody").arg(nb.path.replace(root.home, "~")))
+      return
+    }
     actionProc.notebookIndex = root.captureIndex
     actionProc.typePrefix = root.activeType ? input.text.slice(0, input.text.length - root.prefix.rest.length) : ""
     actionProc.kind = kind
@@ -555,6 +586,70 @@ Item {
     Qt.callLater(root.runNextInit)
   }
 
+  function fetchTrustDiff() {
+    var nb = root.trustAsking
+    if (!nb) return
+    if (root.trustDiff && root.trustDiff.path === nb.path) return
+    root.trustDiff = null
+    trustDiffProc.target = nb.path
+    trustDiffProc.command = [root.script, "trust", "--diff", nb.path]
+    trustDiffProc.running = true
+  }
+
+  function applyTrustDiff(text) {
+    var result = Zettel.parseJson(text)
+    if (!result || result.path !== trustDiffProc.target) return
+    var lines = String(result.diff || "").split("\n").filter(function(l, i, all) {
+      return !(i === all.length - 1 && l === "")
+    }).map(function(l) {
+      var kind = l.indexOf("+++ ") === 0 || l.indexOf("--- ") === 0 || l.indexOf("diff ") === 0 ? "file"
+        : l.indexOf("@@") === 0 ? "hunk" : l.charAt(0) === "+" ? "add" : l.charAt(0) === "-" ? "del" : "same"
+      // A file the copy leaves out (see render_view in bin/zettel) is one line:
+      // zettel:hidden, why, a short hash and, for a link, where it leads.
+      var hidden = /^([-+ ])zettel:hidden\t(outside|large|binary)\t([0-9a-f]{12})\t(.*)$/.exec(l)
+      if (hidden) {
+        var said = hidden[2] === "outside" ? strings.t("trust.hidden.outside").arg(hidden[4]).arg(hidden[3])
+          : strings.t("trust.hidden." + hidden[2]).arg(hidden[3])
+        return { text: (hidden[1] + said).slice(0, 300), kind: kind }
+      }
+      return { text: l.replace(/^diff -ruN .*$/, "").slice(0, 300), kind: kind }
+    }).filter(function(l) { return l.kind !== "file" || l.text.indexOf("+++ ") === 0 })
+    root.trustDiff = { path: result.path, known: !!result.known, lines: lines }
+    trustFlick.contentY = 0
+  }
+
+  // agreed: trust the notebook shown. Otherwise skip it for this session.
+  function answerTrust(agreed) {
+    var nb = root.trustAsking
+    if (!nb) return
+    if (!agreed) {
+      root.trustDiff = null
+      // With nothing else to work with, skipping would leave an empty window:
+      // close it instead, and ask again on the next open.
+      var others = root.notebooks.filter(function(n) {
+        return n.path !== nb.path && root.distrusted.indexOf(n.name) < 0
+      })
+      if (others.length === 0) { root.close(); return }
+      var skipped = {}
+      for (var k in root.trustSkipped) skipped[k] = true
+      skipped[nb.path] = true
+      root.trustSkipped = skipped
+      root.trustDiff = null
+      root.checkStatus()
+      return
+    }
+    if (trustProc.running) return
+    trustProc.command = [root.script, "trust", nb.path]
+    trustProc.running = true
+  }
+
+  function openTrustConfig() {
+    var nb = root.trustAsking
+    if (!nb) return
+    root.close()
+    root.openInEditor(nb.path + "/.zk/config.toml")
+  }
+
   function installZk() {
     root.close()
     Quickshell.execDetached(["xdg-terminal-exec", "bash", "-c",
@@ -588,6 +683,16 @@ Item {
       return true
     }
 
+    if (event.key === Qt.Key_Escape && root.phase === "untrusted") { root.answerTrust(false); return true }
+    if (root.phase === "untrusted") {
+      if (enter && ctrl) root.answerTrust(true)
+      else if (enter) root.openTrustConfig()
+      else if (event.key === Qt.Key_Up) trustFlick.scrollBy(-1)
+      else if (event.key === Qt.Key_Down) trustFlick.scrollBy(1)
+      else if (event.key === Qt.Key_PageUp) trustFlick.scrollBy(-10)
+      else if (event.key === Qt.Key_PageDown) trustFlick.scrollBy(10)
+      return true
+    }
     if (event.key === Qt.Key_Escape) {
       if (input.text) input.text = ""
       else root.close()
@@ -600,6 +705,7 @@ Item {
       if (enter) { root.installZk(); return true }
       return true
     }
+
     if (root.phase !== "ready") return enter || event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab
 
     if (root.isKey(event, "E")) { root.editTemplate(); return true }
@@ -819,6 +925,20 @@ Item {
   }
 
   Process {
+    id: trustProc
+    onExited: { root.trustDiff = null; root.checkStatus() }
+  }
+
+  Process {
+    id: trustDiffProc
+    property string target: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyTrustDiff(text)
+    }
+  }
+
+  Process {
     id: initProc
     property string target: ""
     stdout: StdioCollector {
@@ -955,6 +1075,160 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             text: root.setupOffer.offer ? strings.t("welcome.hint") : ""
+          }
+        }
+      }
+
+      // ---- trust: zk runs commands from a notebook's own configuration
+      Rectangle {
+        anchors.fill: parent
+        anchors.topMargin: card.contentTopInset
+        anchors.rightMargin: card.contentRightInset
+        anchors.bottomMargin: card.contentBottomInset
+        anchors.leftMargin: card.contentLeftInset
+        z: 10
+        visible: root.phase === "untrusted" && !root.welcome
+        color: root.background
+        radius: root.cornerRadius
+
+        MouseArea { anchors.fill: parent; onClicked: setupKeys.forceActiveFocus() }
+
+        Column {
+          id: trustTop
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.margins: root.contentMargin
+          spacing: Style.space(8)
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.Wrap
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+            text: root.trustAsking
+              ? strings.t(root.trustDiff && !root.trustDiff.known ? "trust.titleNew" : "trust.title")
+                  .arg(root.trustAsking.name) : ""
+          }
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            elide: Text.ElideMiddle
+            color: root.foreground
+            opacity: 0.6
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            text: root.trustAsking ? String(root.trustAsking.path).replace(root.home, "~") + "/.zk" : ""
+          }
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.Wrap
+            color: root.foreground
+            opacity: 0.8
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            text: strings.t("trust.body")
+          }
+        }
+
+        Rectangle {
+          id: trustBox
+          anchors.top: trustTop.bottom
+          anchors.bottom: trustBottom.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.margins: root.contentMargin
+          color: "transparent"
+          border.width: 1
+          border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+          radius: root.cornerRadius
+
+          Flickable {
+            id: trustFlick
+            anchors.fill: parent
+            anchors.margins: Style.space(10)
+            clip: true
+            contentWidth: width
+            contentHeight: trustLines.implicitHeight
+            boundsBehavior: Flickable.StopAtBounds
+            readonly property real lineHeight: Style.font.caption * 1.5
+            function scrollBy(lines) {
+              contentY = Math.max(0, Math.min(contentHeight - height, contentY + lines * lineHeight))
+            }
+
+            Column {
+              id: trustLines
+              width: parent.width
+              Repeater {
+                model: root.trustDiff ? root.trustDiff.lines : []
+                Text {
+                  required property var modelData
+                  textFormat: Text.PlainText
+                  width: trustLines.width
+                  wrapMode: Text.WrapAnywhere
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: modelData.kind === "file"
+                  color: modelData.kind === "add" ? Commons.Color.accent
+                    : modelData.kind === "del" ? Commons.Color.urgent
+                    : root.foreground
+                  opacity: modelData.kind === "same" || modelData.kind === "hunk" ? 0.55 : 1
+                  text: modelData.kind === "file" ? modelData.text.replace(/^\+\+\+ b\//, "") : modelData.text
+                }
+              }
+            }
+          }
+          Text {
+            anchors.centerIn: parent
+            visible: !!root.trustDiff && root.trustDiff.lines.length === 0
+            textFormat: Text.PlainText
+            color: root.foreground
+            opacity: 0.6
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            text: strings.t("trust.noDiff")
+          }
+        }
+
+        Column {
+          id: trustBottom
+          anchors.bottom: parent.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.margins: root.contentMargin
+          spacing: Style.space(10)
+
+          Row {
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: Style.space(12)
+            Button {
+              bordered: true
+              text: strings.t("trust.open")
+              onClicked: root.openTrustConfig()
+            }
+            Button {
+              text: strings.t("trust.yes")
+              onClicked: root.answerTrust(true)
+            }
+            Button {
+              text: strings.t("trust.no")
+              onClicked: root.answerTrust(false)
+            }
+          }
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            elide: Text.ElideRight
+            color: root.foreground
+            opacity: 0.5
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            text: strings.t("trust.hint")
           }
         }
       }
@@ -1442,6 +1716,7 @@ Item {
             var typing = input.text.length > 0
             var hint = strings.t((root.defaultKind === "daily" ? "hint.readyJournal" : "hint.ready") + (typing ? "Typing" : ""))
             if (root.multiNotebook) hint += "  ·  " + strings.t("hint.notebook")
+            if (root.distrusted.length > 0) hint = strings.t("hint.distrusted").arg(root.distrusted.join(", ")) + "  ·  " + hint
             if (root.missingNotebooks.length > 0) hint += "  ·  " + strings.t("hint.missing").arg(root.missingNotebooks.join(", "))
             // A sync conflict matters more than the key hints: say it first.
             if (root.conflicts.length > 0)

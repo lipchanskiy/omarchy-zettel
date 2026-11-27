@@ -17,6 +17,9 @@
 #                                             manage the notebooks in Zettel's config
 #   zettel config [path]                         create the config if missing, print its path
 #   zettel setup [--check|--no-shortcut|--remove] shortcut, `zettel` command and config (see cmd_setup)
+#   zettel trust PATH...                         trust a notebook's zk configuration as it is now
+#   zettel trust --diff PATH                     what changed in .zk since it was last trusted
+#   zettel trust --forget PATH                   stop trusting a notebook
 #
 # Zettel's settings live in ${XDG_CONFIG_HOME:-~/.config}/zettel/config.jsonc. The
 # window reads them itself and passes what a command needs as options:
@@ -30,6 +33,12 @@
 #
 # User text only ever travels as argv or stdin, never through eval or a shell
 # string, so a query or note cannot run commands.
+#
+# A notebook's own zk configuration can: an [alias] named like a zk command
+# replaces it, and templates can call {{sh}}. A notebook that arrives through
+# sync, git or an archive is someone else's code, so zk is only run on a
+# notebook whose .zk folder is exactly as the user last trusted it (see
+# notebook_trusted). Notebooks Zettel creates are trusted from the start.
 
 set -uo pipefail
 
@@ -112,7 +121,7 @@ while (($#)); do
     [[ -n $journal_dir ]] || journal_dir="journal"
     shift 2
     ;;
-  --check | --no-shortcut | --remove)
+  --check | --no-shortcut | --remove | --diff | --forget)
     positional+=("$1")
     shift
     ;;
@@ -149,6 +158,146 @@ need_one_notebook() {
   is_notebook "${nb_paths[0]}" || die "not a zk notebook: ${nb_paths[0]}"
 }
 
+# --- trust -------------------------------------------------------------------
+
+STATE_DIR=${ZETTEL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/zettel}
+TRUST_FILE=$STATE_DIR/trusted.json
+
+# One hash over every file zk reads from the notebook's .zk folder (config,
+# templates, anything added later), following symlinks; only zk's own index is
+# left out. File names are part of the hash, so adding a file changes it too.
+notebook_hash() {
+  local dir=$1/.zk
+  [[ -d $dir ]] || return 1
+  (cd "$dir" && find -L . -type f ! -name 'notebook.db*' -print0 2>/dev/null |
+    LC_ALL=C sort -z | xargs -0r sha256sum --) | sha256sum | cut -d' ' -f1
+}
+
+notebook_key() { realpath -m -- "$1"; }
+
+# A copy of .zk as it was when trusted, kept only to show what changed. It holds
+# the text files that live inside .zk; a link leading outside it, a binary file
+# or one over VIEW_MAX becomes a single line naming it and its hash, so nothing
+# from elsewhere is copied or shown, yet a change to it still shows.
+snapshot_dir() { printf '%s/trusted/%s' "$STATE_DIR" "$(notebook_key "$1" | sha256sum | cut -c1-32)"; }
+
+VIEW_MAX=262144
+
+render_view() (
+  umask 077
+  zk=$1 out=$2
+  base=$(realpath -- "$zk") && mkdir -p -- "$out" || exit 1
+  while IFS= read -r -d '' f; do
+    f=${f#./}
+    real=$(realpath -- "$zk/$f") || continue
+    reason=""
+    if [[ $real != "$base"/* ]]; then reason=outside
+    elif (($(stat -c %s -- "$real") > VIEW_MAX)); then reason=large
+    elif [[ -s $real ]] && ! grep -Iq '' -- "$real"; then reason=binary
+    fi
+    mkdir -p -- "$out/$(dirname -- "$f")" || exit 1
+    if [[ -z $reason ]]; then
+      cat -- "$real" >"$out/$f" || exit 1
+    else
+      [[ $reason == outside ]] || real=""
+      printf 'zettel:hidden\t%s\t%s\t%s\n' "$reason" "$(sha256sum -- "$zk/$f" | cut -c1-12)" "$real" >"$out/$f" || exit 1
+    fi
+  done < <(cd "$zk" && find -L . -type f ! -name 'notebook.db*' -print0 2>/dev/null | LC_ALL=C sort -z)
+)
+
+save_snapshot() {
+  local snap tmp
+  snap=$(snapshot_dir "$1")
+  tmp=$snap.tmp.$$
+  mkdir -p "$STATE_DIR/trusted" && chmod 700 "$STATE_DIR/trusted" || return 1
+  rm -rf "$tmp"
+  render_view "$1/.zk" "$tmp" || { rm -rf "$tmp"; return 1; }
+  rm -rf "$snap" && mv "$tmp" "$snap"
+}
+
+notebook_trusted() {
+  local h key
+  [[ -f $TRUST_FILE ]] || return 1
+  h=$(notebook_hash "$1") || return 1
+  key=$(notebook_key "$1")
+  jq -e --arg k "$key" --arg h "$h" '.[$k] == $h' "$TRUST_FILE" >/dev/null 2>&1
+}
+
+trust_notebook() {
+  local h key current='{}'
+  h=$(notebook_hash "$1") || return 1
+  key=$(notebook_key "$1")
+  mkdir -p "$STATE_DIR" || return 1
+  [[ -f $TRUST_FILE ]] && current=$(jq -c 'if type == "object" then . else {} end' "$TRUST_FILE" 2>/dev/null || echo '{}')
+  save_snapshot "$1" || return 1
+  jq -c --arg k "$key" --arg h "$h" '.[$k] = $h' <<<"$current" >"$TRUST_FILE.tmp.$$" &&
+    mv -f "$TRUST_FILE.tmp.$$" "$TRUST_FILE"
+}
+
+forget_notebook() {
+  local key
+  key=$(notebook_key "$1")
+  rm -rf "$(snapshot_dir "$1")"
+  [[ -f $TRUST_FILE ]] || return 0
+  jq -c --arg k "$key" 'if type == "object" then del(.[$k]) else {} end' "$TRUST_FILE" >"$TRUST_FILE.tmp.$$" &&
+    mv -f "$TRUST_FILE.tmp.$$" "$TRUST_FILE"
+}
+
+# Unified diff of .zk against the trusted copy (or against nothing, for a
+# notebook never trusted here), paths relative to .zk, capped for the window.
+trust_diff() {
+  local root=$1 snap work
+  snap=$(snapshot_dir "$root")
+  work=$(mktemp -d) || return 1
+  if render_view "$root/.zk" "$work/b"; then
+    if [[ -d $snap ]]; then ln -s "$snap" "$work/a"; else mkdir "$work/a"; fi
+    (cd "$work" && LC_ALL=C diff -ruN a b 2>/dev/null) |
+      sed -e "/^\(+++\|---\) /s/\t.*//" | head -n 400 | cut -c1-300
+  fi
+  rm -rf "$work"
+  return 0
+}
+
+need_trusted() {
+  notebook_trusted "$1" || die "untrusted notebook: $1"
+}
+
+cmd_trust() {
+  local mode=trust p rows="[]"
+  case ${positional[0]:-} in
+  --diff | --forget)
+    mode=${positional[0]#--}
+    positional=("${positional[@]:1}")
+    ;;
+  esac
+  ((${#positional[@]})) || die "usage: zettel trust [--diff|--forget] PATH..."
+  if [[ $mode == diff ]]; then
+    p=$(expand_path "${positional[0]}")
+    is_notebook "$p" || die "not a zk notebook: $p"
+    local known=false
+    [[ -d $(snapshot_dir "$p") ]] && known=true
+    trust_diff "$p" | jq -Rsc --arg path "$p" --argjson known $known \
+      '{path: $path, known: $known, diff: .}'
+    return
+  fi
+  if [[ $mode == forget ]]; then
+    for p in "${positional[@]}"; do
+      p=$(expand_path "$p")
+      forget_notebook "$p" || die "cannot update $TRUST_FILE"
+      rows=$(jq -c --arg p "$p" '. + [$p]' <<<"$rows")
+    done
+    jq -cn --argjson t "$rows" '{forgotten: $t}'
+    return
+  fi
+  for p in "${positional[@]}"; do
+    p=$(expand_path "$p")
+    is_notebook "$p" || die "not a zk notebook: $p"
+    trust_notebook "$p" || die "cannot save trust for $p"
+    rows=$(jq -c --arg p "$p" '. + [$p]' <<<"$rows")
+  done
+  jq -cn --argjson t "$rows" '{trusted: $t}'
+}
+
 # --- status ----------------------------------------------------------------
 
 cmd_status() {
@@ -157,19 +306,20 @@ cmd_status() {
     zk_version=$(zk --version 2>/dev/null | head -1)
   fi
   for i in "${!nb_paths[@]}"; do
-    local p=${nb_paths[$i]} exists=false notebook=false empty=false conflicts="[]"
+    local p=${nb_paths[$i]} exists=false notebook=false empty=false conflicts="[]" trusted=false
     [[ -e $p ]] && exists=true
     [[ -d $p && -z $(ls -A -- "$p" 2>/dev/null) ]] && empty=true
     if is_notebook "$p"; then
       notebook=true
+      notebook_trusted "$p" && trusted=true
       conflicts=$(conflict_files "$p" | sed "s|^$p/||" | sort -u | while IFS= read -r c; do
         printf '%s\037%s\n' "$c" "$(conflict_original <<<"$c")"; done |
         jq -Rsc 'split("\n") | map(select(. != "") | split("\u001f") | {copy: .[0], original: .[1]})')
     fi
     rows=$(jq -c --arg name "${nb_names[$i]}" --arg path "$p" \
-      --argjson exists $exists --argjson notebook $notebook --argjson empty $empty --argjson conflicts "$conflicts" \
+      --argjson exists $exists --argjson notebook $notebook --argjson empty $empty --argjson conflicts "$conflicts" --argjson trusted $trusted \
       --argjson home "$([[ ${p%/} == "${HOME%/}" ]] && echo true || echo false)" \
-      '. + [{name: $name, path: $path, exists: $exists, empty: $empty, notebook: $notebook, isHome: $home, conflicts: $conflicts}]' <<<"$rows")
+      '. + [{name: $name, path: $path, exists: $exists, empty: $empty, notebook: $notebook, trusted: $trusted, isHome: $home, conflicts: $conflicts}]' <<<"$rows")
   done
   jq -cn --arg zk "$zk_version" --argjson notebooks "$rows" \
     '{zk: ($zk != ""), zkVersion: $zk, notebooks: $notebooks}'
@@ -247,13 +397,18 @@ cmd_search() {
     [[ $arg == --match ]] && sort_args=()
   done
 
-  local i lists=() errors="[]"
+  local i lists=() errors="[]" untrusted="[]" usable=()
   for i in "${!nb_paths[@]}"; do
     local p=${nb_paths[$i]} name=${nb_names[$i]} out
     if ! is_notebook "$p"; then
       errors=$(jq -c --arg n "$name" '. + [$n]' <<<"$errors")
       continue
     fi
+    if ! notebook_trusted "$p"; then
+      untrusted=$(jq -c --arg n "$name" '. + [$n]' <<<"$untrusted")
+      continue
+    fi
+    usable+=("$i")
     if out=$(zk list --notebook-dir "$p" --format json --quiet --no-pager \
       --limit "$limit" "${sort_args[@]}" "${filter_args[@]}" 2>/dev/null); then
       [[ -z $out ]] && out="[]"
@@ -275,9 +430,8 @@ cmd_search() {
         [[ ${filter_args[$k]} == --tag ]] && tag_args+=(--tag "${filter_args[$((k + 1))]}")
       done
       lists=()
-      for i in "${!nb_paths[@]}"; do
+      for i in "${usable[@]}"; do
         local p=${nb_paths[$i]} name=${nb_names[$i]} out
-        is_notebook "$p" || continue
         out=$(zk list --notebook-dir "$p" --format json --quiet --no-pager --limit "$limit" \
           --sort modified- --match-strategy re "${fuzzy_args[@]}" "${tag_args[@]}" 2>/dev/null) || out="[]"
         [[ -z $out ]] && out="[]"
@@ -287,11 +441,11 @@ cmd_search() {
   fi
 
   # Interleave notebooks so relevance ranking survives the merge, then cap.
-  printf '%s\n' "${lists[@]:-[]}" | jq -cs --argjson limit "$limit" --argjson errors "$errors" '
+  printf '%s\n' "${lists[@]:-[]}" | jq -cs --argjson limit "$limit" --argjson errors "$errors" --argjson untrusted "$untrusted" '
     . as $lists
     | ([ $lists[] | length ] | max // 0) as $n
     | { notes: ([ range(0; $n) as $i | $lists[] | .[$i] // empty ] | .[0:$limit]),
-        errors: $errors }'
+        errors: $errors, untrusted: $untrusted }'
 }
 
 # --- types -----------------------------------------------------------------
@@ -390,6 +544,9 @@ add_type() {
   [[ $name == journal ]] && die "journal is built in"
   types_json "$root" | jq -e --arg id "$name" 'any(.[]; .id == $id)' >/dev/null && die "type $name already exists"
 
+  # Zettel's own edit keeps a trusted notebook trusted; it never makes one so.
+  local was_trusted=false
+  notebook_trusted "$root" && was_trusted=true
   mkdir -p "$root/$name" "$root/.zk/templates" || die "cannot create the $name folder"
   local tpl=$root/.zk/templates/$name.md
   if [[ ! -f $tpl ]]; then
@@ -399,6 +556,7 @@ add_type() {
     printf '\n# Note type added by Zettel. Shape its template in .zk/templates/%s.md\n' "$name"
     printf '[group."%s"]\npaths = ["%s"]\n\n[group."%s".note]\ntemplate = "%s.md"\n' "$name" "$name" "$name" "$name"
   } >>"$cfg" || die "cannot update $cfg"
+  $was_trusted && trust_notebook "$root"
   types_json "$root" | jq -c --arg id "$name" '.[] | select(.id == $id)'
 }
 
@@ -416,6 +574,7 @@ cmd_new() {
   need_zk
   need_one_notebook
   local root=${nb_paths[0]}
+  need_trusted "$root"
   [[ -n ${text//[[:space:]]/} || -n $note_type ]] || die "empty note"
 
   local title body tags title_clean dir
@@ -482,6 +641,9 @@ cmd_new() {
 cmd_daily() {
   need_one_notebook
   local root=${nb_paths[0]}
+  # The journal is written without zk, but an untrusted notebook is off as a
+  # whole: half a notebook working would be more confusing than safe.
+  need_trusted "$root"
   [[ -n ${text//[[:space:]]/} ]] || die "empty entry"
 
   local day file heading
@@ -586,9 +748,12 @@ do_init() {
   local root=$1
   if is_notebook "$root"; then
     # An existing notebook only gets what makes it safe to sync.
-    local touched
+    local touched was_trusted=false
+    notebook_trusted "$root" && was_trusted=true
     touched=$({ ensure_sync_files "$root"; ensure_zk_compat "$root"; } | jq -Rsc 'split("\n") | map(select(. != ""))')
-    jq -cn --arg path "$root" --argjson t "$touched" '{path: $path, created: false, updated: $t}'
+    $was_trusted && trust_notebook "$root"
+    jq -cn --arg path "$root" --argjson t "$touched" --argjson trusted $was_trusted \
+      '{path: $path, created: false, updated: $t, trusted: $trusted}'
     return
   fi
   mkdir -p "$root/.zk/templates" "$root/inbox" "$root/journal" || die "cannot create $root"
@@ -652,11 +817,13 @@ EOF
 EOF
 
   ensure_sync_files "$root" >/dev/null
+  # Zettel wrote every file in .zk just now.
+  trust_notebook "$root"
 
   if command -v zk >/dev/null 2>&1; then
     zk index --notebook-dir "$root" --quiet >/dev/null 2>&1
   fi
-  jq -cn --arg path "$root" '{path: $path, created: true}'
+  jq -cn --arg path "$root" '{path: $path, created: true, trusted: true}'
 }
 
 cmd_init() {
@@ -827,7 +994,6 @@ cmd_notebook() {
 
 # --- setup -----------------------------------------------------------------
 
-STATE_DIR=${ZETTEL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/zettel}
 BINDINGS_FILE=${ZETTEL_BINDINGS:-$HOME/.config/hypr/bindings.lua}
 BIN_LINK=${ZETTEL_BIN_LINK:-$HOME/.local/bin/zettel}
 PLUGIN_ID=lipchanskiy.zettel
@@ -955,5 +1121,6 @@ init) cmd_init ;;
 notebook) cmd_notebook ;;
 config) cmd_config ;;
 setup) cmd_setup ;;
-*) die "usage: zettel status|search|types|new|daily|init|notebook|config|setup" ;;
+trust) cmd_trust ;;
+*) die "usage: zettel status|search|types|new|daily|init|notebook|config|setup|trust" ;;
 esac

@@ -218,6 +218,24 @@ To change the shortcut, edit the line Zettel added to `~/.config/hypr/bindings.l
 o.bind("SUPER + N", "Notes", { panel = "lipchanskiy.zettel" })
 ```
 
+### Trusting a notebook
+
+zk runs commands written in a notebook's own settings: an `[alias]` in `.zk/config.toml` can replace a zk command, `[tool]` names the programs zk starts, and templates can call `{{sh}}`. A notebook that arrives through sync, git or an archive could carry such a command, and Zettel calls zk every time the window opens.
+
+So Zettel uses a notebook only while its `.zk` folder is exactly as you last trusted it. Notebooks Zettel creates, and changes Zettel itself makes (a new note type, `zettel init`), are trusted on the spot. When anything else in `.zk` changes, whether you edited a template or the change came from another machine, the window shows what changed, line by line, before doing anything with that notebook:
+
+| Key | Does |
+|---|---|
+| Enter | Open the notebook's settings in your editor |
+| Ctrl+Enter | Trust the notebook as it is now |
+| Esc | Not now: the notebook stays off (no search, no new notes, no journal) and the window asks again next time |
+
+From a terminal: `zettel trust --diff PATH` shows the changes, `zettel trust PATH` trusts them, and `zettel trust --forget PATH` takes trust back.
+
+Trust is kept per folder on this computer, in `~/.local/state/zettel/`. Each computer that syncs the notebook asks once on its own.
+
+To show what changed, Zettel keeps a copy of the trusted `.zk` there, readable only by you. It holds just the text files inside `.zk`. A link leading outside the notebook, a binary file or a file over 256 KB is neither copied nor shown: the copy notes only its fingerprint, so a change to it still shows up.
+
 ## The `zettel` command
 
 The window runs everything through `zettel`, and it works on its own too. Every command prints JSON.
@@ -231,6 +249,9 @@ zettel config                            # create the settings file if missing, 
 zettel setup                             # bind the shortcut and link the command
 zettel setup --remove                    # undo both
 zettel init PATH                         # create a notebook, or bring an existing one up to date
+zettel trust PATH                        # trust a notebook's .zk settings as they are now
+zettel trust --diff PATH                 # what changed in .zk since it was trusted
+zettel trust --forget PATH               # stop trusting a notebook
 zettel types --nb NAME PATH              # note types of a notebook
 zettel types add TYPE --nb NAME PATH     # add a note type
 zettel search --nb NAME PATH -- QUERY    # search (repeat --nb for several notebooks)
@@ -250,6 +271,7 @@ For anything beyond this, use [zk](https://zk-org.github.io/zk/) itself: `zk lis
 | The shortcut | `~/.config/hypr/bindings.lua` |
 | The `zettel` command | `~/.local/bin/zettel`, a link into the plugin |
 | First-run record | `~/.local/state/zettel/setup.json` |
+| Trusted notebooks | `~/.local/state/zettel/trusted.json` and `trusted/`, a private copy of the text files in each trusted `.zk` |
 | The plugin | `~/.config/omarchy/plugins/lipchanskiy.zettel/` |
 
 ## Update and uninstall
